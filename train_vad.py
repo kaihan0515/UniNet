@@ -6,7 +6,7 @@ import numpy as np
 import os
 
 from UniNet_lib.resnet import wide_resnet50_2
-from UniNet_lib.de_resnet import de_wide_resnet50_2
+from UniNet_lib.de_resnet_cls import de_wide_resnet50_2
 from datasets import loading_dataset
 import torch.backends.cudnn as cudnn
 from eval import evaluation_vad
@@ -81,3 +81,4 @@ def train(c):
         # print('Sample Auroc: {:.2f}'.format(auroc_sp))
 
     return
+
