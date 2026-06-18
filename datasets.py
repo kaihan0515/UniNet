@@ -18,11 +18,11 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="importlib._bo
 
 BTAD_PATH = os.path.abspath(os.path.join("D:\ws/btad"))
 
-industrial = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD"]
+industrial = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD", "SteelBall"]
 medical = ["APTOS", "ISIC2018", "OCT2017", "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB"]
 video = ['Ped2',]
 
-unsupervised = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "APTOS", "ISIC2018", "OCT2017", 'Ped2']
+unsupervised = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "APTOS", "ISIC2018", "OCT2017", 'Ped2', "SteelBall"]
 supervised = ["Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "VAD"]
 
 mvtec_list = ['carpet', 'bottle', 'hazelnut', 'leather', 'cable', 'capsule', 'grid', 'pill',
@@ -38,6 +38,10 @@ btad_list = ["01", "02", "03"]
 
 visa_list = ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1',
              'macaroni2', 'pcb1', 'pcb2', 'pcb3', 'pcb4', 'pipe_fryum']
+
+# steel-ball (鋼珠): one object, 12 defect *types* live as subfolders under test/ and ground_truth/
+# (built by prepare_data/prepare_steelball.py into ../data/steelball/steelball/)
+steelball_list = ['steelball']
 
 
 def loading_dataset(c, dataset_name):
@@ -59,6 +63,14 @@ def loading_dataset(c, dataset_name):
         # train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=c.batch_size, shuffle=True)
         train_data = MVTecDataset(c, is_train=True)
         test_data = MVTecDataset(c, is_train=False)
+        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=c.batch_size, shuffle=True,
+                                                       pin_memory=True)
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)
+
+    elif dataset_name == 'SteelBall' and c.setting == 'oc':
+        # steel-ball uses the MVTec single-category layout under ../data/steelball/
+        train_data = MVTecDataset(c, is_train=True, dataset='steelball')
+        test_data = MVTecDataset(c, is_train=False, dataset='steelball')
         train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=c.batch_size, shuffle=True,
                                                        pin_memory=True)
         test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)

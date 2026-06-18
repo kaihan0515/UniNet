@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training artifacts / logs
+saved_results/
+*.log
+smoke_train.log
+
+# Model checkpoints (large; trained locally)
+ckpts/**/*.pth
+ckpts/**/*.pt
+
+# Datasets live outside the repo (../data); ignore any local copies
+/data/
+/mvtec/
+/visa/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

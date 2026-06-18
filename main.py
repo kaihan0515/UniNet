@@ -3,7 +3,7 @@ import os
 
 from train_unsupervisedAD import train
 from datasets import preprocess_for_3d, unsupervised, supervised, industrial, medical, video, \
-    mvtec_list, btad_list, mvtec3d_list, visa_list
+    mvtec_list, btad_list, mvtec3d_list, visa_list, steelball_list
 import argparse
 from utils import setup_seed, get_logger
 from test import test
@@ -18,7 +18,7 @@ def parsing_args():
                         help="choose experimental settings, including one-class, multi-class, cross-dataset.")
     parser.add_argument('--dataset', default='VisA', type=str,
                         choices=['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD", "APTOS", "ISIC2018", "OCT2017",
-                                 "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "Ped2"],
+                                 "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "Ped2", "SteelBall"],
                         help="choose experimental dataset.")
     parser.add_argument('--epochs', default=100, type=int, help="epochs.")
     parser.add_argument('--batch_size', default=8, type=int, help="batch sizes.")
@@ -71,6 +71,9 @@ if __name__ == '__main__':
             dataset = visa_list
         elif dataset_name == 'VAD':
             dataset = [dataset_name]
+            c.setting = 'oc'
+        elif dataset_name == 'SteelBall':
+            dataset = steelball_list
             c.setting = 'oc'
 
     elif dataset_name in medical:
