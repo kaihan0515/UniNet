@@ -17,6 +17,7 @@ import os
 import sys
 import glob
 import copy
+import csv
 
 import numpy as np
 import torch
@@ -64,11 +65,26 @@ IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+CODE_NAMES = {
+    "100": "小黑傷", "101": "灰傷刻痕", "102": "麻點", "103": "大黑傷",
+    "104": "研磨傷", "105": "肯傷", "106": "刮傷", "107": "生鏽",
+    "108": "霧面", "109": "亮傷-暗", "110": "小白點線", "111": "亮傷-亮",
+    "good": "良品",
+}
+
+
 def list_images(folder):
     files = []
     for e in IMG_EXTS:
         files += glob.glob(os.path.join(folder, e))
     return sorted(files)
+
+
+def make_overlay_bgr(pil, disp):
+    """原圖(BGR) 疊上 JET 熱圖，回傳 BGR np.uint8。"""
+    bgr = np.array(pil)[:, :, ::-1].copy()
+    heat = cv2.applyColorMap((disp * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    return cv2.addWeighted(bgr, 0.55, heat, 0.45, 0)
 
 
 # ===========================================================================
@@ -181,7 +197,7 @@ class LoadWorker(QtCore.QThread):
 
 class EvalWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(int, int, str)
-    done = QtCore.pyqtSignal(object, object, object)   # paths, labels, scores
+    done = QtCore.pyqtSignal(object, object, object, object)   # paths, labels, scores, cats
 
     def __init__(self, model, test_dir):
         super().__init__()
@@ -189,7 +205,7 @@ class EvalWorker(QtCore.QThread):
         self.test_dir = test_dir
 
     def run(self):
-        paths, labels = [], []
+        paths, labels, cats = [], [], []
         for sub in sorted(os.listdir(self.test_dir)):
             d = os.path.join(self.test_dir, sub)
             if not os.path.isdir(d):
@@ -198,12 +214,49 @@ class EvalWorker(QtCore.QThread):
             for f in list_images(d):
                 paths.append(f)
                 labels.append(label)
+                cats.append(sub)                       # 子資料夾名 = 瑕疵類別代碼
         scores = []
         for i, p in enumerate(paths):
             sc, _ = self.model.predict(Image.open(p).convert("RGB"))
             scores.append(sc)
             self.progress.emit(i + 1, len(paths), "評估測試集")
-        self.done.emit(paths, np.array(labels), np.array(scores, dtype=np.float32))
+        self.done.emit(paths, np.array(labels), np.array(scores, dtype=np.float32), cats)
+
+
+class SaveHeatmapWorker(QtCore.QThread):
+    """批次推論並另存 [原圖 | 熱圖疊加] 圖檔（依類別分子資料夾）。"""
+    progress = QtCore.pyqtSignal(int, int, str)
+    done = QtCore.pyqtSignal(int, str)                 # 已存張數, 輸出資料夾
+
+    def __init__(self, model, items, out_dir, threshold):
+        super().__init__()
+        self.model = model
+        self.items = items                             # list of (path, cat)
+        self.out_dir = out_dir
+        self.threshold = threshold
+
+    def run(self):
+        n, cnt = len(self.items), 0
+        for i, (p, cat) in enumerate(self.items):
+            try:
+                pil = Image.open(p).convert("RGB")
+                score, disp = self.model.predict(pil)
+                orig = np.array(pil)[:, :, ::-1].copy()           # BGR
+                overlay = make_overlay_bgr(pil, disp)
+                panel = cv2.hconcat([orig, overlay])
+                is_ng = (self.threshold is not None) and (score > self.threshold)
+                txt = "%s  score=%.3f" % ("NG" if is_ng else "OK", score)
+                color = (0, 0, 255) if is_ng else (0, 200, 0)
+                cv2.putText(panel, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                d = os.path.join(self.out_dir, cat)
+                os.makedirs(d, exist_ok=True)
+                stem = os.path.splitext(os.path.basename(p))[0]
+                cv2.imwrite(os.path.join(d, "%s_heat.png" % stem), panel)
+                cnt += 1
+            except Exception:
+                pass
+            self.progress.emit(i + 1, n, "另存熱圖")
+        self.done.emit(cnt, self.out_dir)
 
 
 # ===========================================================================
@@ -223,7 +276,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_image_path = None
         self.cur_disp_map = None
         self.cur_score = None
-        self.eval_paths = self.eval_labels = self.eval_scores = None
+        self.eval_paths = self.eval_labels = self.eval_scores = self.eval_cats = None
 
         self._build_ui()
         self._start_load()
@@ -248,6 +301,12 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self.list_widget, 1)
         self.btn_eval = QtWidgets.QPushButton("評估測試集（AUC / 分布）")
         left.addWidget(self.btn_eval)
+        out_row = QtWidgets.QHBoxLayout()
+        self.btn_export_csv = QtWidgets.QPushButton("匯出結果 CSV")
+        self.btn_save_heat = QtWidgets.QPushButton("批次另存熱圖")
+        out_row.addWidget(self.btn_export_csv)
+        out_row.addWidget(self.btn_save_heat)
+        left.addLayout(out_row)
 
         # 中：影像顯示 + 判定
         mid = QtWidgets.QVBoxLayout()
@@ -301,6 +360,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_open_img.clicked.connect(self.on_open_image)
         self.btn_open_folder.clicked.connect(self.on_open_folder)
         self.btn_eval.clicked.connect(self.on_eval)
+        self.btn_export_csv.clicked.connect(self.on_export_csv)
+        self.btn_save_heat.clicked.connect(self.on_save_heatmaps)
         self.list_widget.currentItemChanged.connect(self.on_select)
         self.slider.valueChanged.connect(self.on_threshold_changed)
         self._set_busy(True)
@@ -457,8 +518,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.evw.done.connect(self._on_eval_done)
         self.evw.start()
 
-    def _on_eval_done(self, paths, labels, scores):
+    def _on_eval_done(self, paths, labels, scores, cats):
         self.eval_paths, self.eval_labels, self.eval_scores = paths, labels, scores
+        self.eval_cats = cats
         if HAVE_SKLEARN and len(set(labels.tolist())) == 2:
             fpr, tpr, thr = roc_curve(labels, scores)
             j = np.argmax(tpr - fpr)                            # Youden's J
@@ -471,6 +533,62 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_verdict(self.cur_score)
         self._set_busy(False)
         self.status.showMessage("測試集評估完成，共 %d 張。" % len(paths))
+
+    # ---------------- 匯出 CSV ---------------- #
+    def on_export_csv(self):
+        if self.eval_scores is None:
+            QtWidgets.QMessageBox.information(
+                self, "尚未評估", "請先按「評估測試集」產生分數，再匯出 CSV。")
+            return
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "匯出結果 CSV", os.path.join(BASE, "uninet_results.csv"), "CSV (*.csv)")
+        if not f:
+            return
+        thr = self.threshold
+        try:
+            with open(f, "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.writer(fh)
+                w.writerow(["filename", "category", "category_name", "label",
+                            "anomaly_score", "threshold", "prediction", "correct"])
+                for p, lab, sc, cat in zip(self.eval_paths, self.eval_labels,
+                                           self.eval_scores, self.eval_cats):
+                    is_ng = bool(sc > thr)
+                    correct = "Y" if is_ng == (lab == 1) else "N"
+                    w.writerow([os.path.basename(p), cat, CODE_NAMES.get(cat, ""),
+                                "defect" if lab == 1 else "good",
+                                "%.6f" % sc, "%.6f" % thr,
+                                "NG" if is_ng else "OK", correct])
+            self.status.showMessage("已匯出 CSV：%s（%d 列）" % (f, len(self.eval_paths)))
+            QtWidgets.QMessageBox.information(self, "完成", "已匯出：\n%s" % f)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "匯出失敗", str(e))
+
+    # ---------------- 批次另存熱圖 ---------------- #
+    def on_save_heatmaps(self):
+        if not self.model.is_ready():
+            return
+        items = []
+        for i in range(self.list_widget.count()):
+            p = self.list_widget.item(i).data(QtCore.Qt.UserRole)
+            items.append((p, os.path.basename(os.path.dirname(p))))
+        if not items:
+            QtWidgets.QMessageBox.information(
+                self, "沒有影像", "清單沒有影像。請先「開啟資料夾」或載入測試集。")
+            return
+        out = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇熱圖輸出資料夾", BASE)
+        if not out:
+            return
+        self._set_busy(True)
+        self.shw = SaveHeatmapWorker(self.model, items, out, self.threshold)
+        self.shw.progress.connect(self._on_progress)
+        self.shw.done.connect(self._on_save_heat_done)
+        self.shw.start()
+
+    def _on_save_heat_done(self, cnt, out_dir):
+        self._set_busy(False)
+        self.status.showMessage("已另存 %d 張熱圖到：%s" % (cnt, out_dir))
+        QtWidgets.QMessageBox.information(
+            self, "完成", "已另存 %d 張熱圖到：\n%s" % (cnt, out_dir))
 
     def _refresh_metrics(self):
         labels, scores = self.eval_labels, self.eval_scores
@@ -485,7 +603,7 @@ class MainWindow(QtWidgets.QMainWindow):
                if HAVE_SKLEARN and n_good and n_def else float("nan"))
         recall = tp / (tp + fn) * 100 if (tp + fn) else 0
         overkill = fp / (fp + tn) * 100 if (fp + tn) else 0
-        self.lbl_metrics.setText(
+        html = (
             "<b>影像級 AUC: %.2f%%</b><br>"
             "良品 %d / 瑕疵 %d，門檻 %.4f<br>"
             "瑕疵抓出率(Recall): %.1f%% (%d/%d)<br>"
@@ -493,6 +611,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "混淆: TP=%d TN=%d FP=%d FN=%d"
             % (auc, n_good, n_def, thr, recall, tp, tp + fn,
                overkill, fp, fp + tn, tp, tn, fp, fn))
+        # 每類瑕疵抓出率（依測試集子資料夾分組）
+        if self.eval_cats is not None:
+            cats = np.array(self.eval_cats)
+            rows = ""
+            for cat in sorted(set(cats[labels == 1].tolist())):
+                idx = (cats == cat) & (labels == 1)
+                ntot = int(idx.sum())
+                ndet = int((scores[idx] > thr).sum())
+                rate = 100.0 * ndet / ntot if ntot else 0.0
+                color = "#2ecc71" if rate >= 99.9 else ("#e67e22" if rate >= 80 else "#e74c3c")
+                rows += ("<tr><td>%s %s</td><td align='right'>%d/%d</td>"
+                         "<td align='right'><font color='%s'>%.1f%%</font></td></tr>"
+                         % (cat, CODE_NAMES.get(cat, ""), ndet, ntot, color, rate))
+            html += ("<br><b>每類瑕疵抓出率</b>"
+                     "<table cellspacing='4'><tr><td><b>類別</b></td>"
+                     "<td><b>抓出</b></td><td><b>率</b></td></tr>%s</table>" % rows)
+        self.lbl_metrics.setText(html)
 
     def _draw_charts(self):
         labels, scores = self.eval_labels, self.eval_scores
@@ -519,7 +654,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- 工具 ---------------- #
     def _set_busy(self, busy):
-        for w in (self.btn_open_img, self.btn_open_folder, self.btn_eval, self.list_widget):
+        for w in (self.btn_open_img, self.btn_open_folder, self.btn_eval,
+                  self.btn_export_csv, self.btn_save_heat, self.list_widget):
             w.setEnabled(not busy)
         self.progress.setVisible(busy)
 
