@@ -1,0 +1,550 @@
+# -*- coding: utf-8 -*-
+"""
+UniNet 鋼珠檢測 — 成效檢視 GUI  (PyQt5, MVC 架構)
+
+Model      : UniNetADModel — 載入訓練好的 UniNet (source/target teacher + bn +
+             student + DFS) 權重，提供 predict(影像) -> (異常分數, 熱圖)；
+             啟動時用 train/good 計算良品分數分布 -> 預設門檻。
+View       : Qt 視窗 — 原圖 + 異常熱圖疊加、OK/NG、分數、門檻滑桿、
+             AUC/ROC 與分數分布圖。
+Controller : MainWindow 的 slot / 背景執行緒（載入、批次評估）。
+
+執行（從 UniNet repo 根目錄）：
+    conda activate MVA_py310_cu121
+    python uninet_gui.py
+"""
+import os
+import sys
+import glob
+import copy
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms as T
+from torchvision.transforms import InterpolationMode
+from scipy.ndimage import gaussian_filter
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+import matplotlib
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Microsoft YaHei",
+                                           "SimHei", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+try:
+    from sklearn.metrics import roc_auc_score, roc_curve
+    HAVE_SKLEARN = True
+except Exception:
+    HAVE_SKLEARN = False
+
+import cv2
+
+# UniNet internals
+from UniNet_lib.resnet import wide_resnet50_2
+from UniNet_lib.de_resnet import de_wide_resnet50_2
+from UniNet_lib.DFS import DomainRelated_Feature_Selection
+from UniNet_lib.model import UniNet
+from UniNet_lib.mechanism import weighted_decision_mechanism
+from utils import load_weights, to_device
+
+# --------------------------------------------------------------------------- #
+# 預設路徑（可在 GUI 內用按鈕更換）。資料在 repo 外的 ../data。
+# --------------------------------------------------------------------------- #
+BASE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_WEIGHTS_DIR = os.path.join(BASE, "ckpts", "SteelBall", "steelball")
+DEFAULT_TRAIN_GOOD = os.path.normpath(os.path.join(
+    BASE, "..", "data", "steelball", "steelball", "train", "good"))
+DEFAULT_TEST_DIR = os.path.normpath(os.path.join(
+    BASE, "..", "data", "steelball", "steelball", "test"))
+
+IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def list_images(folder):
+    files = []
+    for e in IMG_EXTS:
+        files += glob.glob(os.path.join(folder, e))
+    return sorted(files)
+
+
+# ===========================================================================
+#  MODEL
+# ===========================================================================
+class Cfg:
+    """UniNet 一類 (one-class) 推論所需的最小設定，對齊 main.py 預設。"""
+    dataset = "SteelBall"; setting = "oc"; domain = "industrial"
+    _class_ = "steelball"
+    image_size = 256; center_crop = 256; batch_size = 1
+    T = 2
+    weighted_decision_mechanism = True
+    alpha = 0.01; beta = 0.00003
+
+
+class UniNetADModel:
+    """封裝訓練好的 UniNet，負責推論與門檻設定。"""
+
+    def __init__(self, weights_dir, suffix="BEST_P_PRO", device=DEVICE):
+        self.weights_dir = weights_dir
+        self.suffix = suffix
+        self.device = device
+        self.c = Cfg()
+        self.model = None
+        self.train_good_scores = None
+        self.default_threshold = None
+        self._tf = T.Compose([
+            T.Resize((self.c.image_size, self.c.image_size), InterpolationMode.LANCZOS),
+            T.ToTensor()])
+        self._norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    def is_ready(self):
+        return self.model is not None
+
+    # --- 載入權重（複刻 test.py 的 un_cls 流程）--------------------------- #
+    def load(self):
+        c = self.c
+        Source_teacher, bn = wide_resnet50_2(c, pretrained=True)
+        Source_teacher.layer4 = None
+        Source_teacher.fc = None
+        student = de_wide_resnet50_2(pretrained=False)
+        DFS = DomainRelated_Feature_Selection()
+        [Source_teacher, bn, student, DFS] = to_device(
+            [Source_teacher, bn, student, DFS], self.device)
+        Target_teacher = copy.deepcopy(Source_teacher)
+        ns = load_weights([Target_teacher, bn, student, DFS], self.weights_dir, self.suffix)
+        Target_teacher, bn, student, DFS = ns['tt'], ns['bn'], ns['st'], ns['dfs']
+        self.model = UniNet(c, Source_teacher.to(self.device).eval(),
+                            Target_teacher, bn, student, DFS)
+        self.model.train_or_eval(type='eval')
+
+    # --- 單張推論 ---------------------------------------------------------- #
+    @torch.no_grad()
+    def predict(self, pil_image):
+        """回傳 (異常分數 float, 熱圖 np.float32 HxW 已 min-max 正規化到 0..1)。"""
+        ow, oh = pil_image.size
+        x = self._norm(self._tf(pil_image))[None].to(self.device)
+        t_tf, de_features = self.model(x)
+        output_list = [[] for _ in range(self.model.n * 3)]
+        for l, (t, s) in enumerate(zip(t_tf, de_features)):
+            output_list[l].append(1 - F.cosine_similarity(t, s))
+        score, amap = weighted_decision_mechanism(1, output_list, self.c.alpha, self.c.beta)
+        score = float(np.array(score).reshape(-1)[0])
+        m = gaussian_filter(amap[0], sigma=4)               # 256x256
+        disp = cv2.resize(m, (ow, oh))
+        mn, mx = float(disp.min()), float(disp.max())
+        disp = (disp - mn) / (mx - mn + 1e-8)
+        return score, disp.astype(np.float32)
+
+    # --- 用良品集算分數 -> 預設門檻 --------------------------------------- #
+    @torch.no_grad()
+    def compute_train_scores(self, good_dir, progress=None):
+        files = list_images(good_dir)
+        if not files:
+            raise RuntimeError("找不到良品影像：%s" % good_dir)
+        scores = []
+        for i, f in enumerate(files):
+            sc, _ = self.predict(Image.open(f).convert("RGB"))
+            scores.append(sc)
+            if progress:
+                progress(i + 1, len(files), "計算良品分數")
+        self.train_good_scores = np.array(scores, dtype=np.float32)
+        # 預設門檻：良品最高分再加 10% 緩衝（無監督）
+        self.default_threshold = float(self.train_good_scores.max() * 1.1)
+
+
+# ===========================================================================
+#  背景執行緒
+# ===========================================================================
+class LoadWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(int, int, str)
+    done = QtCore.pyqtSignal(bool, str)
+
+    def __init__(self, model, good_dir):
+        super().__init__()
+        self.model = model
+        self.good_dir = good_dir
+
+    def run(self):
+        try:
+            self.progress.emit(0, 1, "載入模型權重")
+            self.model.load()
+            self.model.compute_train_scores(
+                self.good_dir,
+                progress=lambda i, n, t: self.progress.emit(i, n, t))
+            self.done.emit(True, "")
+        except Exception as e:
+            self.done.emit(False, str(e))
+
+
+class EvalWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(int, int, str)
+    done = QtCore.pyqtSignal(object, object, object)   # paths, labels, scores
+
+    def __init__(self, model, test_dir):
+        super().__init__()
+        self.model = model
+        self.test_dir = test_dir
+
+    def run(self):
+        paths, labels = [], []
+        for sub in sorted(os.listdir(self.test_dir)):
+            d = os.path.join(self.test_dir, sub)
+            if not os.path.isdir(d):
+                continue
+            label = 0 if sub.lower() == "good" else 1
+            for f in list_images(d):
+                paths.append(f)
+                labels.append(label)
+        scores = []
+        for i, p in enumerate(paths):
+            sc, _ = self.model.predict(Image.open(p).convert("RGB"))
+            scores.append(sc)
+            self.progress.emit(i + 1, len(paths), "評估測試集")
+        self.done.emit(paths, np.array(labels), np.array(scores, dtype=np.float32))
+
+
+# ===========================================================================
+#  VIEW + CONTROLLER
+# ===========================================================================
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("UniNet 鋼珠檢測 — 成效檢視")
+        self.resize(1180, 760)
+
+        self.model = UniNetADModel(DEFAULT_WEIGHTS_DIR)
+        self.weights_dir = DEFAULT_WEIGHTS_DIR
+        self.train_good = DEFAULT_TRAIN_GOOD
+        self.test_dir = DEFAULT_TEST_DIR
+        self.threshold = None
+        self.cur_image_path = None
+        self.cur_disp_map = None
+        self.cur_score = None
+        self.eval_paths = self.eval_labels = self.eval_scores = None
+
+        self._build_ui()
+        self._start_load()
+
+    # ---------------- UI ---------------- #
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QHBoxLayout(central)
+
+        # 左：影像清單 + 操作
+        left = QtWidgets.QVBoxLayout()
+        root.addLayout(left, 0)
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_open_img = QtWidgets.QPushButton("開啟單張影像")
+        self.btn_open_folder = QtWidgets.QPushButton("開啟資料夾")
+        btn_row.addWidget(self.btn_open_img)
+        btn_row.addWidget(self.btn_open_folder)
+        left.addLayout(btn_row)
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setMinimumWidth(260)
+        left.addWidget(self.list_widget, 1)
+        self.btn_eval = QtWidgets.QPushButton("評估測試集（AUC / 分布）")
+        left.addWidget(self.btn_eval)
+
+        # 中：影像顯示 + 判定
+        mid = QtWidgets.QVBoxLayout()
+        root.addLayout(mid, 1)
+        img_row = QtWidgets.QHBoxLayout()
+        self.lbl_orig = self._image_label("原始影像")
+        self.lbl_heat = self._image_label("異常熱圖疊加")
+        img_row.addWidget(self.lbl_orig[0])
+        img_row.addWidget(self.lbl_heat[0])
+        mid.addLayout(img_row, 1)
+
+        verdict_box = QtWidgets.QGroupBox("判定結果")
+        v = QtWidgets.QVBoxLayout(verdict_box)
+        self.lbl_verdict = QtWidgets.QLabel("—")
+        self.lbl_verdict.setAlignment(QtCore.Qt.AlignCenter)
+        f = self.lbl_verdict.font(); f.setPointSize(26); f.setBold(True)
+        self.lbl_verdict.setFont(f)
+        self.lbl_score = QtWidgets.QLabel("異常分數: —    門檻: —")
+        self.lbl_score.setAlignment(QtCore.Qt.AlignCenter)
+        v.addWidget(self.lbl_verdict)
+        v.addWidget(self.lbl_score)
+        thr_row = QtWidgets.QHBoxLayout()
+        thr_row.addWidget(QtWidgets.QLabel("門檻"))
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setEnabled(False)
+        thr_row.addWidget(self.slider, 1)
+        self.lbl_thr_val = QtWidgets.QLabel("—")
+        thr_row.addWidget(self.lbl_thr_val)
+        v.addLayout(thr_row)
+        mid.addWidget(verdict_box)
+
+        # 右：圖表 + 指標
+        right = QtWidgets.QVBoxLayout()
+        root.addLayout(right, 1)
+        self.canvas = FigureCanvas(Figure(figsize=(4.2, 6)))
+        self.ax_hist = self.canvas.figure.add_subplot(211)
+        self.ax_roc = self.canvas.figure.add_subplot(212)
+        self._init_axes()
+        right.addWidget(self.canvas, 1)
+        self.lbl_metrics = QtWidgets.QLabel("尚未評估測試集")
+        self.lbl_metrics.setWordWrap(True)
+        right.addWidget(self.lbl_metrics)
+
+        # 狀態列
+        self.status = self.statusBar()
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setMaximumWidth(260)
+        self.status.addPermanentWidget(self.progress)
+
+        # 事件
+        self.btn_open_img.clicked.connect(self.on_open_image)
+        self.btn_open_folder.clicked.connect(self.on_open_folder)
+        self.btn_eval.clicked.connect(self.on_eval)
+        self.list_widget.currentItemChanged.connect(self.on_select)
+        self.slider.valueChanged.connect(self.on_threshold_changed)
+        self._set_busy(True)
+
+    def _image_label(self, title):
+        box = QtWidgets.QGroupBox(title)
+        lay = QtWidgets.QVBoxLayout(box)
+        lbl = QtWidgets.QLabel("（無影像）")
+        lbl.setAlignment(QtCore.Qt.AlignCenter)
+        lbl.setMinimumSize(320, 320)
+        lbl.setStyleSheet("background:#222;color:#888;")
+        lay.addWidget(lbl)
+        return box, lbl
+
+    def _init_axes(self):
+        self.ax_hist.set_title("分數分布"); self.ax_hist.set_xlabel("anomaly score")
+        self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
+        self.canvas.figure.tight_layout()
+        self.canvas.draw()
+
+    # ---------------- 載入 ---------------- #
+    def _start_load(self):
+        if not os.path.exists(os.path.join(self.weights_dir, self.model.suffix + ".pth")):
+            QtWidgets.QMessageBox.warning(
+                self, "找不到權重",
+                "找不到權重檔：\n%s\n\n請先訓練（python main.py --dataset SteelBall ...），"
+                "或用『載入權重資料夾』選擇。" % os.path.join(self.weights_dir, self.model.suffix + ".pth"))
+        self.status.showMessage("載入模型中… (device=%s)" % DEVICE)
+        self.loader = LoadWorker(self.model, self.train_good)
+        self.loader.progress.connect(self._on_progress)
+        self.loader.done.connect(self._on_loaded)
+        self.loader.start()
+
+    def _on_progress(self, i, n, text):
+        self.progress.setMaximum(n); self.progress.setValue(i)
+        self.status.showMessage("%s … %d/%d" % (text, i, n))
+
+    def _on_loaded(self, ok, err):
+        if not ok:
+            QtWidgets.QMessageBox.critical(self, "載入失敗",
+                "無法載入模型/權重：\n%s\n\n權重路徑：\n%s" % (err, self.weights_dir))
+            self.status.showMessage("載入失敗")
+            return
+        self.threshold = self.model.default_threshold
+        self._setup_slider()
+        self.status.showMessage("模型就緒（device=%s）。可開啟影像或評估測試集。" % DEVICE)
+        self._set_busy(False)
+        if os.path.isdir(self.test_dir):
+            self._populate_from_test_dir()
+
+    def _setup_slider(self):
+        lo = 0.0
+        hi = max(self.model.default_threshold * 2.0,
+                 float(self.model.train_good_scores.max()) * 2.0)
+        self._thr_lo, self._thr_hi = lo, hi
+        self.slider.setMinimum(0); self.slider.setMaximum(1000)
+        self.slider.setEnabled(True)
+        self._set_slider_to(self.threshold)
+
+    def _set_slider_to(self, val):
+        frac = (val - self._thr_lo) / (self._thr_hi - self._thr_lo + 1e-9)
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(np.clip(frac, 0, 1) * 1000))
+        self.slider.blockSignals(False)
+        self.lbl_thr_val.setText("%.4f" % val)
+
+    # ---------------- 影像清單 ---------------- #
+    def _populate_from_test_dir(self):
+        self.list_widget.clear()
+        for sub in sorted(os.listdir(self.test_dir)):
+            d = os.path.join(self.test_dir, sub)
+            if not os.path.isdir(d):
+                continue
+            for f in list_images(d):
+                it = QtWidgets.QListWidgetItem("[%s] %s" % (sub, os.path.basename(f)))
+                it.setData(QtCore.Qt.UserRole, f)
+                self.list_widget.addItem(it)
+
+    def on_open_image(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "選擇影像", self.test_dir, "影像 (*.jpg *.jpeg *.png *.bmp)")
+        if f:
+            it = QtWidgets.QListWidgetItem(os.path.basename(f))
+            it.setData(QtCore.Qt.UserRole, f)
+            self.list_widget.addItem(it)
+            self.list_widget.setCurrentItem(it)
+
+    def on_open_folder(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾", self.test_dir)
+        if not d:
+            return
+        self.list_widget.clear()
+        for f in list_images(d):
+            it = QtWidgets.QListWidgetItem(os.path.basename(f))
+            it.setData(QtCore.Qt.UserRole, f)
+            self.list_widget.addItem(it)
+
+    # ---------------- 單張推論 ---------------- #
+    def on_select(self, cur, _prev):
+        if cur is None or not self.model.is_ready():
+            return
+        path = cur.data(QtCore.Qt.UserRole)
+        self.cur_image_path = path
+        try:
+            pil = Image.open(path).convert("RGB")
+        except Exception as e:
+            self.status.showMessage("無法開啟影像：%s" % e)
+            return
+        score, disp = self.model.predict(pil)
+        self.cur_score = score
+        self.cur_disp_map = disp
+        self._show_image(pil, disp)
+        self._update_verdict(score)
+
+    def _show_image(self, pil, disp_map):
+        self.lbl_orig[1].setPixmap(self._pil_to_pix(pil, self.lbl_orig[1]))
+        rgb = np.array(pil)[:, :, ::-1].copy()                 # to BGR
+        heat = cv2.applyColorMap((disp_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(rgb, 0.55, heat, 0.45, 0)
+        overlay = overlay[:, :, ::-1].copy()                   # to RGB
+        self.lbl_heat[1].setPixmap(self._np_to_pix(overlay, self.lbl_heat[1]))
+
+    def _update_verdict(self, score):
+        thr = self.threshold
+        is_ng = (thr is not None) and (score > thr)
+        self.lbl_verdict.setText("NG（瑕疵）" if is_ng else "OK（良品）")
+        self.lbl_verdict.setStyleSheet("color:#e74c3c;" if is_ng else "color:#2ecc71;")
+        self.lbl_score.setText("異常分數: %.4f    門檻: %s"
+                               % (score, "%.4f" % thr if thr is not None else "—"))
+
+    # ---------------- 門檻滑桿 ---------------- #
+    def on_threshold_changed(self, vv):
+        self.threshold = self._thr_lo + (vv / 1000.0) * (self._thr_hi - self._thr_lo)
+        self.lbl_thr_val.setText("%.4f" % self.threshold)
+        if self.cur_score is not None:
+            self._update_verdict(self.cur_score)
+        if self.eval_scores is not None:
+            self._refresh_metrics()
+            self._draw_charts()
+
+    # ---------------- 批次評估 ---------------- #
+    def on_eval(self):
+        if not self.model.is_ready():
+            return
+        if not os.path.isdir(self.test_dir):
+            d = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "選擇測試集資料夾（內含 good/ 與瑕疵子資料夾）", BASE)
+            if not d:
+                return
+            self.test_dir = d
+        self._set_busy(True)
+        self.evw = EvalWorker(self.model, self.test_dir)
+        self.evw.progress.connect(self._on_progress)
+        self.evw.done.connect(self._on_eval_done)
+        self.evw.start()
+
+    def _on_eval_done(self, paths, labels, scores):
+        self.eval_paths, self.eval_labels, self.eval_scores = paths, labels, scores
+        if HAVE_SKLEARN and len(set(labels.tolist())) == 2:
+            fpr, tpr, thr = roc_curve(labels, scores)
+            j = np.argmax(tpr - fpr)                            # Youden's J
+            self.threshold = float(thr[j])
+            self._thr_hi = max(self._thr_hi, float(scores.max()) * 1.2)
+            self._set_slider_to(self.threshold)
+        self._refresh_metrics()
+        self._draw_charts()
+        if self.cur_score is not None:
+            self._update_verdict(self.cur_score)
+        self._set_busy(False)
+        self.status.showMessage("測試集評估完成，共 %d 張。" % len(paths))
+
+    def _refresh_metrics(self):
+        labels, scores = self.eval_labels, self.eval_scores
+        thr = self.threshold
+        pred = (scores > thr).astype(int)
+        tp = int(((pred == 1) & (labels == 1)).sum())
+        tn = int(((pred == 0) & (labels == 0)).sum())
+        fp = int(((pred == 1) & (labels == 0)).sum())
+        fn = int(((pred == 0) & (labels == 1)).sum())
+        n_good = int((labels == 0).sum()); n_def = int((labels == 1).sum())
+        auc = (roc_auc_score(labels, scores) * 100
+               if HAVE_SKLEARN and n_good and n_def else float("nan"))
+        recall = tp / (tp + fn) * 100 if (tp + fn) else 0
+        overkill = fp / (fp + tn) * 100 if (fp + tn) else 0
+        self.lbl_metrics.setText(
+            "<b>影像級 AUC: %.2f%%</b><br>"
+            "良品 %d / 瑕疵 %d，門檻 %.4f<br>"
+            "瑕疵抓出率(Recall): %.1f%% (%d/%d)<br>"
+            "良品過殺率: %.1f%% (%d/%d)<br>"
+            "混淆: TP=%d TN=%d FP=%d FN=%d"
+            % (auc, n_good, n_def, thr, recall, tp, tp + fn,
+               overkill, fp, fp + tn, tp, tn, fp, fn))
+
+    def _draw_charts(self):
+        labels, scores = self.eval_labels, self.eval_scores
+        self.ax_hist.clear(); self.ax_roc.clear()
+        good = scores[labels == 0]; bad = scores[labels == 1]
+        bins = 30
+        if len(good):
+            self.ax_hist.hist(good, bins=bins, alpha=0.6, label="良品 good", color="#2ecc71")
+        if len(bad):
+            self.ax_hist.hist(bad, bins=bins, alpha=0.6, label="瑕疵 defect", color="#e74c3c")
+        if self.threshold is not None:
+            self.ax_hist.axvline(self.threshold, color="k", ls="--", lw=1.2, label="門檻")
+        self.ax_hist.set_title("分數分布"); self.ax_hist.set_xlabel("anomaly score")
+        self.ax_hist.legend(fontsize=8)
+        if HAVE_SKLEARN and len(set(labels.tolist())) == 2:
+            fpr, tpr, _ = roc_curve(labels, scores)
+            auc = roc_auc_score(labels, scores)
+            self.ax_roc.plot(fpr, tpr, color="#2980b9", label="AUC=%.3f" % auc)
+            self.ax_roc.plot([0, 1], [0, 1], "k--", lw=0.8)
+            self.ax_roc.legend(fontsize=8)
+        self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
+        self.canvas.figure.tight_layout()
+        self.canvas.draw()
+
+    # ---------------- 工具 ---------------- #
+    def _set_busy(self, busy):
+        for w in (self.btn_open_img, self.btn_open_folder, self.btn_eval, self.list_widget):
+            w.setEnabled(not busy)
+        self.progress.setVisible(busy)
+
+    @staticmethod
+    def _pil_to_pix(pil, label):
+        return MainWindow._np_to_pix(np.array(pil), label)
+
+    @staticmethod
+    def _np_to_pix(arr, label):
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, -1)
+        arr = np.ascontiguousarray(arr)
+        h, w, _ = arr.shape
+        qimg = QtGui.QImage(arr.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+        return pix.scaled(label.width(), label.height(),
+                          QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
