@@ -119,10 +119,19 @@ def eval_seg_pro(gt_mask, anomaly_score_map, max_step=800):
     delta = (max_th - min_th) / max_step
     threds = np.arange(min_th, max_th, delta).tolist()
 
-    # Sequential, no multiprocessing. Windows spawn-based Pool is flaky here (WinError 5
-    # under handle pressure, and re-importing the CUDA-heavy main module in workers can
-    # destabilize the run). A plain loop is fully deterministic and never crashes training.
-    ret = [single_process(anomaly_score_map, gt_mask, t) for t in threds]
+    # Use a THREAD pool, not a process pool. Windows spawn-based multiprocessing.Pool is
+    # flaky here (WinError 5, and workers re-import the CUDA-heavy main module, which can
+    # destabilize the run). ThreadPool keeps the parallel speed-up but uses threads, so it
+    # never spawns subprocesses or re-imports anything — fast and stable on Windows.
+    # label()/regionprops()/numpy release the GIL, so threads still parallelize well.
+    from multiprocessing.pool import ThreadPool
+    try:
+        pool = ThreadPool(8)
+        ret = pool.map(partial(single_process, anomaly_score_map, gt_mask), threds)
+        pool.close()
+        pool.join()
+    except Exception:
+        ret = [single_process(anomaly_score_map, gt_mask, t) for t in threds]
     pros_mean = []
     fprs = []
     for pro_mean, fpr in ret:
