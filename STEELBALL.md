@@ -82,10 +82,44 @@ Test only (after a checkpoint exists):
 python main.py --dataset SteelBall --setting oc --load_ckpts
 ```
 
+## Results (256px, one-class)
+
+Full 100-epoch training on a healthy GPU reaches (best checkpoint):
+
+| metric | value |
+|--------|-------|
+| image AUROC | **100.0** |
+| pixel AUROC | **~85** |
+| pixel AUPRO | **~57** |
+
+The defects are tiny (median ~0.1% of image area), so image-level detection saturates
+early while pixel-level localization needs the full run to converge.
+
+## Hardware notes (RTX 2080 Ti, 11 GB)
+
+UniNet uses **two** wide_resnet50_2 backbones (source + target teacher) plus the student
+and DFS, so it is memory-heavy:
+
+- `256px @ batch 4` ≈ 7.6 GB — **recommended on 11 GB**.
+- `256px @ batch 8` ≈ 10.9 GB — fits when the GPU is otherwise idle.
+- `288px` / `384px` — exceed 11 GB (cuDNN/OOM); also note UniNet's evaluation hardcodes
+  256px anomaly maps, so non-256 resolutions break pixel evaluation. Stick to 256px here.
+
+The evaluation phase (every 10 epochs) is the memory peak. If a run dies *silently*
+during eval (no Python traceback) after the GPU was churned by killed processes, the
+driver/CUDA state is likely degraded — **reboot** and rerun; the run completes normally on
+a clean GPU. `prepare_data/run_steelball_256.sh` waits for a free GPU and runs one clean
+256px train+test; it sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to limit
+fragmentation.
+
 ## What was changed vs. upstream
 
 - `datasets.py` — registered `SteelBall` in the `industrial` + `unsupervised` lists, added
   `steelball_list`, and a one-class loader branch reusing `MVTecDataset(dataset='steelball')`.
 - `main.py` — added `SteelBall` to the CLI choices and dataset routing (forces `oc`).
 - `train_unsupervisedAD.py` — included `SteelBall` in the industrial-AD eval/checkpoint-save path.
+- `eval.py` — made the AUPRO computation's `multiprocessing.Pool` fall back to a sequential
+  pass on Windows `PermissionError`/`OSError`, so evaluation never crashes the run.
 - `prepare_data/prepare_steelball.py` — **new** dataset + mask builder (this adaptation).
+- `prepare_data/run_steelball_256.sh` — **new** helper: waits for a free GPU, then runs one
+  clean 256px train+test (batch 4, expandable-segments allocator).
