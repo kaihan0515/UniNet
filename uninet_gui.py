@@ -81,9 +81,9 @@ def list_images(folder):
 
 
 def make_overlay_bgr(pil, disp):
-    """原圖(BGR) 疊上 JET 熱圖，回傳 BGR np.uint8。"""
+    """原圖(BGR) 疊上 JET 熱圖。disp 為 0–255 的熱圖，回傳 BGR np.uint8。"""
     bgr = np.array(pil)[:, :, ::-1].copy()
-    heat = cv2.applyColorMap((disp * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    heat = cv2.applyColorMap(np.clip(disp, 0, 255).astype(np.uint8), cv2.COLORMAP_JET)
     return cv2.addWeighted(bgr, 0.55, heat, 0.45, 0)
 
 
@@ -151,7 +151,7 @@ class UniNetADModel:
         m = gaussian_filter(amap[0], sigma=4)               # 256x256
         disp = cv2.resize(m, (ow, oh))
         mn, mx = float(disp.min()), float(disp.max())
-        disp = (disp - mn) / (mx - mn + 1e-8)
+        disp = (disp - mn) / (mx - mn + 1e-8) * 255.0       # min-max 正規化到 0–255
         return score, disp.astype(np.float32)
 
     # --- 用良品集算分數 -> 預設門檻 --------------------------------------- #
@@ -478,7 +478,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_image(self, pil, disp_map):
         self.lbl_orig[1].setPixmap(self._pil_to_pix(pil, self.lbl_orig[1]))
         rgb = np.array(pil)[:, :, ::-1].copy()                 # to BGR
-        heat = cv2.applyColorMap((disp_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        heat = cv2.applyColorMap(np.clip(disp_map, 0, 255).astype(np.uint8), cv2.COLORMAP_JET)
         overlay = cv2.addWeighted(rgb, 0.55, heat, 0.45, 0)
         overlay = overlay[:, :, ::-1].copy()                   # to RGB
         self.lbl_heat[1].setPixmap(self._np_to_pix(overlay, self.lbl_heat[1]))
