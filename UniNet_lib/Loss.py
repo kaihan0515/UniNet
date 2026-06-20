@@ -51,7 +51,7 @@ def losses(b, a, T, margin, λ=0.7, mask=None, stop_gradient=False):
             # gt mask
             else:
                 mask_ = F.interpolate(mask, size=(h, w), mode='nearest').squeeze(1)
-                mask_flat = mask.view(mask_.size(0), -1)
+                mask_flat = mask_.reshape(mask_.size(0), -1)   # 用內插後的 mask，尺寸對齊 diag_sim
 
                 normal_mask = (mask_flat == 0)
                 abnormal_mask = (mask_flat == 1)
