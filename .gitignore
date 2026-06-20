@@ -31,3 +31,4 @@ test_result.log
 /uninet_results.csv
 ckpts/**/*.csv
 /heatmap/
+RESULTS_REPORT.html
