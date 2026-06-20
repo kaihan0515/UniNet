@@ -266,7 +266,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("UniNet 鋼珠檢測 — 成效檢視")
-        self.resize(1180, 760)
+        self.resize(1480, 820)
 
         self.model = UniNetADModel(DEFAULT_WEIGHTS_DIR)
         self.weights_dir = DEFAULT_WEIGHTS_DIR
@@ -293,8 +293,10 @@ class MainWindow(QtWidgets.QMainWindow):
         img_row = QtWidgets.QHBoxLayout()
         self.lbl_orig = self._image_label("原始影像")
         self.lbl_heat = self._image_label("異常熱圖疊加")
+        self.lbl_mask = self._image_label("瑕疵遮罩 (GT)")
         img_row.addWidget(self.lbl_orig[0])
         img_row.addWidget(self.lbl_heat[0])
+        img_row.addWidget(self.lbl_mask[0])
         disp.addLayout(img_row, 1)
 
         verdict_box = QtWidgets.QGroupBox("判定結果")
@@ -312,9 +314,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # ===== 圖表區（中）：分數分布 / ROC + 指標 =====
         charts = QtWidgets.QVBoxLayout()
         root.addLayout(charts, 2)
-        self.canvas = FigureCanvas(Figure(figsize=(4.2, 6)))
-        self.ax_hist = self.canvas.figure.add_subplot(211)
-        self.ax_roc = self.canvas.figure.add_subplot(212)
+        self.canvas = FigureCanvas(Figure(figsize=(4.6, 6)))
+        self.ax_hist = self.canvas.figure.add_subplot(2, 1, 1)   # 上：分數分布
+        self.ax_roc = self.canvas.figure.add_subplot(2, 2, 3)    # 下左：ROC
+        self.ax_cm = self.canvas.figure.add_subplot(2, 2, 4)     # 下右：混淆矩陣
         self._init_axes()
         charts.addWidget(self.canvas, 1)
         self.lbl_metrics = QtWidgets.QLabel("尚未評估測試集")
@@ -365,19 +368,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.valueChanged.connect(self.on_threshold_changed)
         self._set_busy(True)
 
-    def _image_label(self, title):
+    def _image_label(self, title, minsize=260):
         box = QtWidgets.QGroupBox(title)
         lay = QtWidgets.QVBoxLayout(box)
         lbl = QtWidgets.QLabel("（無影像）")
         lbl.setAlignment(QtCore.Qt.AlignCenter)
-        lbl.setMinimumSize(320, 320)
+        lbl.setMinimumSize(minsize, minsize)
         lbl.setStyleSheet("background:#222;color:#888;")
         lay.addWidget(lbl)
         return box, lbl
 
+    def _gt_path_for(self, img_path):
+        """從測試影像路徑推 ground_truth 遮罩路徑（test/<cat>/x.jpg -> ground_truth/<cat>/x.png）。"""
+        cat = os.path.basename(os.path.dirname(img_path))
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        gt = os.path.join(os.path.dirname(self.test_dir), "ground_truth", cat, stem + ".png")
+        return gt if os.path.exists(gt) else None
+
     def _init_axes(self):
         self.ax_hist.set_title("分數分布"); self.ax_hist.set_xlabel("anomaly score")
         self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
+        self.ax_cm.set_title("混淆矩陣")
         self.canvas.figure.tight_layout()
         self.canvas.draw()
 
@@ -473,7 +484,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_score = score
         self.cur_disp_map = disp
         self._show_image(pil, disp)
+        self._show_mask(path)
         self._update_verdict(score)
+
+    def _show_mask(self, img_path):
+        gt = self._gt_path_for(img_path)
+        if gt is None:
+            self.lbl_mask[1].setPixmap(QtGui.QPixmap())
+            self.lbl_mask[1].setText("（無遮罩 / 良品）")
+            return
+        m = cv2.imread(gt, 0)
+        if m is None:
+            self.lbl_mask[1].setText("（遮罩讀取失敗）")
+            return
+        self.lbl_mask[1].setPixmap(self._np_to_pix(np.stack([m] * 3, -1), self.lbl_mask[1]))
 
     def _show_image(self, pil, disp_map):
         self.lbl_orig[1].setPixmap(self._pil_to_pix(pil, self.lbl_orig[1]))
@@ -630,7 +654,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _draw_charts(self):
         labels, scores = self.eval_labels, self.eval_scores
-        self.ax_hist.clear(); self.ax_roc.clear()
+        self.ax_hist.clear(); self.ax_roc.clear(); self.ax_cm.clear()
         good = scores[labels == 0]; bad = scores[labels == 1]
         bins = 30
         if len(good):
@@ -648,6 +672,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ax_roc.plot([0, 1], [0, 1], "k--", lw=0.8)
             self.ax_roc.legend(fontsize=8)
         self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
+
+        # 混淆矩陣（依目前門檻）
+        thr = self.threshold
+        pred = (scores > thr).astype(int)
+        tn = int(((pred == 0) & (labels == 0)).sum()); fp = int(((pred == 1) & (labels == 0)).sum())
+        fn = int(((pred == 0) & (labels == 1)).sum()); tp = int(((pred == 1) & (labels == 1)).sum())
+        cm = np.array([[tn, fp], [fn, tp]])
+        self.ax_cm.imshow(cm, cmap="Blues")
+        self.ax_cm.set_xticks([0, 1]); self.ax_cm.set_xticklabels(["OK", "NG"])
+        self.ax_cm.set_yticks([0, 1]); self.ax_cm.set_yticklabels(["良品", "瑕疵"])
+        self.ax_cm.set_xlabel("預測"); self.ax_cm.set_ylabel("實際")
+        self.ax_cm.set_title("混淆矩陣")
+        half = cm.max() / 2.0 if cm.max() else 0.5
+        for i in range(2):
+            for j in range(2):
+                self.ax_cm.text(j, i, str(cm[i, j]), ha="center", va="center",
+                                color="white" if cm[i, j] > half else "black", fontsize=11)
         self.canvas.figure.tight_layout()
         self.canvas.draw()
 
