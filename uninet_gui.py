@@ -332,14 +332,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # ===== 顯示區（左）：影像 + 判定 =====
         disp = QtWidgets.QVBoxLayout()
         root.addLayout(disp, 2)
-        img_row = QtWidgets.QHBoxLayout()
-        self.lbl_orig = self._image_label("原始影像", 210)
-        self.lbl_heat = self._image_label("異常熱圖疊加", 210)
-        self.lbl_pred = self._image_label("UniNet 預測遮罩", 210)
-        self.lbl_mask = self._image_label("瑕疵遮罩 (GT)", 210)
-        for box in (self.lbl_orig, self.lbl_heat, self.lbl_pred, self.lbl_mask):
-            img_row.addWidget(box[0])
-        disp.addLayout(img_row, 1)
+        img_grid = QtWidgets.QGridLayout()
+        self.lbl_orig = self._image_label("原始影像", 240)
+        self.lbl_heat = self._image_label("異常熱圖疊加", 240)
+        self.lbl_pred = self._image_label("UniNet 預測遮罩", 240)
+        self.lbl_mask = self._image_label("瑕疵遮罩 (GT)", 240)
+        img_grid.addWidget(self.lbl_orig[0], 0, 0)   # 上左：原圖
+        img_grid.addWidget(self.lbl_heat[0], 0, 1)   # 上右：熱圖
+        img_grid.addWidget(self.lbl_pred[0], 1, 0)   # 下左：預測遮罩
+        img_grid.addWidget(self.lbl_mask[0], 1, 1)   # 下右：GT 遮罩
+        disp.addLayout(img_grid, 1)
 
         verdict_box = QtWidgets.QGroupBox("判定結果")
         v = QtWidgets.QVBoxLayout(verdict_box)
