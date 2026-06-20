@@ -92,14 +92,14 @@ def train(c):
 
         # ------------------------------------eval industrial and video-------------------------------------
 
-        if dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", 'ped2', "SteelBall"]:
+        if dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", 'ped2', "SteelBall", "SteelBallA"]:
             print('epoch [{}/{}], loss:{:.4f}'.format(epoch + 1, c.epochs, np.mean(loss_list)))
 
         modules_list = [model.t.t_t, model.bn.bn, model.s.s1, DFS]
         best_iroc = False
         if (epoch + 1) % 10 == 0 and c.domain in ['industrial', 'video']:
 
-            if dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "SteelBall"]:
+            if dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "SteelBall", "SteelBallA"]:
                 # evaluation
                 auroc_px, auroc_sp, aupro_px = evaluation_indusAD(c, model, test_dataloader, device)
                 print('Sample Auroc: {:.1f}, Pixel Auroc: {:.1f}, Pixel Aupro: {:.1f}'.format(auroc_sp, auroc_px,
@@ -130,7 +130,7 @@ def train(c):
         try:
             _loss = float(np.mean(loss_list)) if loss_list else float("nan")
             _ev = ((epoch + 1) % 10 == 0 and c.domain in ['industrial', 'video']
-                   and dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "SteelBall"])
+                   and dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "SteelBall", "SteelBallA"])
             _log_rows.append([epoch + 1, round(_loss, 6),
                               round(float(auroc_sp), 4) if _ev else "",
                               round(float(auroc_px), 4) if _ev else "",

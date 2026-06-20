@@ -18,7 +18,7 @@ def parsing_args():
                         help="choose experimental settings, including one-class, multi-class, cross-dataset.")
     parser.add_argument('--dataset', default='VisA', type=str,
                         choices=['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD", "APTOS", "ISIC2018", "OCT2017",
-                                 "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "Ped2", "SteelBall"],
+                                 "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "Ped2", "SteelBall", "SteelBallA"],
                         help="choose experimental dataset.")
     parser.add_argument('--epochs', default=100, type=int, help="epochs.")
     parser.add_argument('--batch_size', default=8, type=int, help="batch sizes.")
@@ -72,7 +72,7 @@ if __name__ == '__main__':
         elif dataset_name == 'VAD':
             dataset = [dataset_name]
             c.setting = 'oc'
-        elif dataset_name == 'SteelBall':
+        elif dataset_name in ('SteelBall', 'SteelBallA'):
             dataset = steelball_list
             c.setting = 'oc'
 

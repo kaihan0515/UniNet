@@ -18,11 +18,11 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="importlib._bo
 
 BTAD_PATH = os.path.abspath(os.path.join("D:\ws/btad"))
 
-industrial = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD", "SteelBall"]
+industrial = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "VAD", "SteelBall", "SteelBallA"]
 medical = ["APTOS", "ISIC2018", "OCT2017", "Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB"]
 video = ['Ped2',]
 
-unsupervised = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "APTOS", "ISIC2018", "OCT2017", 'Ped2', "SteelBall"]
+unsupervised = ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "APTOS", "ISIC2018", "OCT2017", 'Ped2', "SteelBall", "SteelBallA"]
 supervised = ["Kvasir-SEG", "CVC-ClinicDB", "CVC-ColonDB", "VAD"]
 
 mvtec_list = ['carpet', 'bottle', 'hazelnut', 'leather', 'cable', 'capsule', 'grid', 'pill',
@@ -71,6 +71,14 @@ def loading_dataset(c, dataset_name):
         # steel-ball uses the MVTec single-category layout under ../data/steelball/
         train_data = MVTecDataset(c, is_train=True, dataset='steelball')
         test_data = MVTecDataset(c, is_train=False, dataset='steelball')
+        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=c.batch_size, shuffle=True,
+                                                       pin_memory=True)
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)
+
+    elif dataset_name == 'SteelBallA' and c.setting == 'oc':
+        # 對齊版（registration）：../data/steelball_aligned/
+        train_data = MVTecDataset(c, is_train=True, dataset='steelball_aligned')
+        test_data = MVTecDataset(c, is_train=False, dataset='steelball_aligned')
         train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=c.batch_size, shuffle=True,
                                                        pin_memory=True)
         test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)
