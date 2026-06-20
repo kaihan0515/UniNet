@@ -137,14 +137,25 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     crit = nn.CrossEntropyLoss(weight=w)
 
+    losses = []
     for ep in range(args.epochs):
         model.train(); tot = 0.0
         for x, y in dl_tr:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(); loss = crit(model(x), y); loss.backward(); opt.step()
             tot += loss.item() * x.size(0)
+        losses.append(tot / len(tr))
         if ep == 0 or (ep + 1) % 5 == 0:
-            print("epoch %d/%d  loss=%.4f" % (ep + 1, args.epochs, tot / len(tr)))
+            print("epoch %d/%d  loss=%.4f" % (ep + 1, args.epochs, losses[-1]))
+
+    # loss 曲線
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(range(1, len(losses) + 1), losses, marker="o", ms=3, lw=1.5, color="#2980b9")
+    ax.set_title("分類器訓練 Loss 曲線"); ax.set_xlabel("epoch"); ax.set_ylabel("loss")
+    ax.grid(alpha=0.3); fig.tight_layout()
+    loss_png = os.path.join(args.out, "classifier_loss_curve.png")
+    fig.savefig(loss_png, dpi=150); plt.close(fig)
+    print("saved ->", loss_png)
 
     model.eval(); ys, ps = [], []
     with torch.no_grad():
