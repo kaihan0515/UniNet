@@ -314,10 +314,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # ===== 圖表區（中）：分數分布 / ROC + 指標 =====
         charts = QtWidgets.QVBoxLayout()
         root.addLayout(charts, 2)
-        self.canvas = FigureCanvas(Figure(figsize=(4.6, 6)))
-        self.ax_hist = self.canvas.figure.add_subplot(2, 1, 1)   # 上：分數分布
-        self.ax_roc = self.canvas.figure.add_subplot(2, 2, 3)    # 下左：ROC
-        self.ax_cm = self.canvas.figure.add_subplot(2, 2, 4)     # 下右：混淆矩陣
+        self.canvas = FigureCanvas(Figure(figsize=(4.2, 6)))
+        self.ax_hist = self.canvas.figure.add_subplot(211)
+        self.ax_roc = self.canvas.figure.add_subplot(212)
         self._init_axes()
         charts.addWidget(self.canvas, 1)
         self.lbl_metrics = QtWidgets.QLabel("尚未評估測試集")
@@ -388,7 +387,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _init_axes(self):
         self.ax_hist.set_title("分數分布"); self.ax_hist.set_xlabel("anomaly score")
         self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
-        self.ax_cm.set_title("混淆矩陣")
         self.canvas.figure.tight_layout()
         self.canvas.draw()
 
@@ -654,7 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _draw_charts(self):
         labels, scores = self.eval_labels, self.eval_scores
-        self.ax_hist.clear(); self.ax_roc.clear(); self.ax_cm.clear()
+        self.ax_hist.clear(); self.ax_roc.clear()
         good = scores[labels == 0]; bad = scores[labels == 1]
         bins = 30
         if len(good):
@@ -672,23 +670,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ax_roc.plot([0, 1], [0, 1], "k--", lw=0.8)
             self.ax_roc.legend(fontsize=8)
         self.ax_roc.set_title("ROC"); self.ax_roc.set_xlabel("FPR"); self.ax_roc.set_ylabel("TPR")
-
-        # 混淆矩陣（依目前門檻）
-        thr = self.threshold
-        pred = (scores > thr).astype(int)
-        tn = int(((pred == 0) & (labels == 0)).sum()); fp = int(((pred == 1) & (labels == 0)).sum())
-        fn = int(((pred == 0) & (labels == 1)).sum()); tp = int(((pred == 1) & (labels == 1)).sum())
-        cm = np.array([[tn, fp], [fn, tp]])
-        self.ax_cm.imshow(cm, cmap="Blues")
-        self.ax_cm.set_xticks([0, 1]); self.ax_cm.set_xticklabels(["OK", "NG"])
-        self.ax_cm.set_yticks([0, 1]); self.ax_cm.set_yticklabels(["良品", "瑕疵"])
-        self.ax_cm.set_xlabel("預測"); self.ax_cm.set_ylabel("實際")
-        self.ax_cm.set_title("混淆矩陣")
-        half = cm.max() / 2.0 if cm.max() else 0.5
-        for i in range(2):
-            for j in range(2):
-                self.ax_cm.text(j, i, str(cm[i, j]), ha="center", va="center",
-                                color="white" if cm[i, j] > half else "black", fontsize=11)
         self.canvas.figure.tight_layout()
         self.canvas.draw()
 

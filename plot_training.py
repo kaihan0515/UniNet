@@ -81,45 +81,49 @@ def plot_loss(log_csv, out_dir):
 
 
 def plot_confusion(results_csv, out_dir):
+    """每個類別一列（良品 + 12 種瑕疵），欄 = OK/NG 預測，全部在同一張圖。"""
     if not os.path.exists(results_csv):
         print("[confusion] 找不到 %s（請先在 GUI 按「匯出結果 CSV」）" % results_csv)
         return None
-    labels, preds, scores, thr = [], [], [], None
+    data = []
     with open(results_csv, encoding="utf-8-sig") as fh:
         for row in csv.DictReader(fh):
-            labels.append(1 if row.get("label") == "defect" else 0)
-            preds.append(1 if row.get("prediction") == "NG" else 0)
-            scores.append(_to_float(row.get("anomaly_score")))
-            thr = _to_float(row.get("threshold"))
-    labels = np.array(labels); preds = np.array(preds); scores = np.array(scores, dtype=float)
-    if len(labels) == 0:
+            data.append(row)
+    if not data:
         print("[confusion] CSV 無資料"); return None
 
-    tn = int(((preds == 0) & (labels == 0)).sum()); fp = int(((preds == 1) & (labels == 0)).sum())
-    fn = int(((preds == 0) & (labels == 1)).sum()); tp = int(((preds == 1) & (labels == 1)).sum())
-    cm = np.array([[tn, fp], [fn, tp]])
+    # 類別排序：good 在最前，其餘依代碼排序
+    cats = sorted(set(r.get("category", "") for r in data),
+                  key=lambda c: (c != "good", c))
+    names, mat = [], np.zeros((len(cats), 2), dtype=int)   # 欄 0=OK, 1=NG
+    for i, cat in enumerate(cats):
+        sub = [r for r in data if r.get("category") == cat]
+        mat[i, 0] = sum(1 for r in sub if r.get("prediction") == "OK")
+        mat[i, 1] = sum(1 for r in sub if r.get("prediction") == "NG")
+        nm = sub[0].get("category_name", "") if sub else ""
+        names.append(("%s %s" % (cat, nm)).strip())
+
+    row_sum = mat.sum(axis=1, keepdims=True)
+    rate = mat / np.maximum(row_sum, 1)                    # 每列正規化（顏色深淺）
+
+    fig, ax = plt.subplots(figsize=(6.4, 0.52 * len(cats) + 1.8))
+    ax.imshow(rate, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks([0, 1]); ax.set_xticklabels(["OK (預測)", "NG (預測)"])
+    ax.set_yticks(range(len(cats))); ax.set_yticklabels(names)
+    for i in range(len(cats)):
+        for j in range(2):
+            ax.text(j, i, "%d\n%.0f%%" % (mat[i, j], rate[i, j] * 100),
+                    ha="center", va="center", fontsize=9,
+                    color="white" if rate[i, j] > 0.5 else "black")
+    # 整體抓出率 / 過殺率（good 列以外視為瑕疵）
+    is_good = np.array([c == "good" for c in cats])
+    tp = mat[~is_good, 1].sum(); fn = mat[~is_good, 0].sum()
+    fp = mat[is_good, 1].sum(); tn = mat[is_good, 0].sum()
     recall = tp / (tp + fn) * 100 if (tp + fn) else 0
     overkill = fp / (fp + tn) * 100 if (fp + tn) else 0
-
-    fig, (axc, axh) = plt.subplots(1, 2, figsize=(11, 4.6))
-    axc.imshow(cm, cmap="Blues")
-    axc.set_xticks([0, 1]); axc.set_xticklabels(["OK (預測)", "NG (預測)"])
-    axc.set_yticks([0, 1]); axc.set_yticklabels(["良品 (實際)", "瑕疵 (實際)"])
-    half = cm.max() / 2.0 if cm.max() else 0.5
-    for i in range(2):
-        for j in range(2):
-            axc.text(j, i, str(cm[i, j]), ha="center", va="center",
-                     color="white" if cm[i, j] > half else "black", fontsize=15)
-    axc.set_title("混淆矩陣  (抓出率 %.1f%% / 過殺率 %.1f%%)" % (recall, overkill))
-
-    good = scores[labels == 0]; bad = scores[labels == 1]
-    if len(good):
-        axh.hist(good, bins=30, alpha=0.6, label="良品 good", color="#2ecc71")
-    if len(bad):
-        axh.hist(bad, bins=30, alpha=0.6, label="瑕疵 defect", color="#e74c3c")
-    if thr is not None:
-        axh.axvline(thr, color="k", ls="--", lw=1.2, label="門檻 %.3f" % thr)
-    axh.set_title("分數分布"); axh.set_xlabel("anomaly score"); axh.legend(fontsize=9)
+    ax.set_title("各類別預測混淆矩陣（列=實際類別）\n"
+                 "瑕疵抓出率 %.1f%% / 良品過殺率 %.1f%%\n"
+                 "(良品→NG=過殺；瑕疵→OK=漏檢)" % (recall, overkill), fontsize=10)
     fig.tight_layout()
     p = os.path.join(out_dir, "confusion_matrix.png")
     fig.savefig(p, dpi=150); plt.close(fig)
