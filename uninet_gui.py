@@ -178,6 +178,21 @@ class UniNetADModel:
         disp = (disp - mn) / (mx - mn + 1e-8) * 255.0       # min-max 正規化到 0–255
         return score, disp.astype(np.float32)
 
+    @torch.no_grad()
+    def predicted_mask(self, pil_image, pct=99.0):
+        """UniNet 預測遮罩：減背景殘差在球內取自身高百分位二值化（uint8 0/255）。"""
+        ow, oh = pil_image.size
+        _, amap = self._infer(pil_image)
+        sm = gaussian_filter(amap, sigma=4)
+        if self.bg_map is not None:
+            sm = np.clip(sm - self.bg_map, 0, None)
+        sub = cv2.resize(sm, (ow, oh))
+        roi = ball_roi_mask(pil_image)
+        sub = sub * roi
+        vals = sub[roi > 0.5]
+        t = float(np.percentile(vals, pct)) if vals.size else 0.0
+        return (((sub > t) & (roi > 0.5)).astype(np.uint8) * 255)
+
     # --- 用良品集算分數 -> 預設門檻 + 平均異常圖(背景基準) --------------- #
     @torch.no_grad()
     def compute_train_scores(self, good_dir, progress=None):
@@ -318,12 +333,12 @@ class MainWindow(QtWidgets.QMainWindow):
         disp = QtWidgets.QVBoxLayout()
         root.addLayout(disp, 2)
         img_row = QtWidgets.QHBoxLayout()
-        self.lbl_orig = self._image_label("原始影像")
-        self.lbl_heat = self._image_label("異常熱圖疊加")
-        self.lbl_mask = self._image_label("瑕疵遮罩 (GT)")
-        img_row.addWidget(self.lbl_orig[0])
-        img_row.addWidget(self.lbl_heat[0])
-        img_row.addWidget(self.lbl_mask[0])
+        self.lbl_orig = self._image_label("原始影像", 210)
+        self.lbl_heat = self._image_label("異常熱圖疊加", 210)
+        self.lbl_pred = self._image_label("UniNet 預測遮罩", 210)
+        self.lbl_mask = self._image_label("瑕疵遮罩 (GT)", 210)
+        for box in (self.lbl_orig, self.lbl_heat, self.lbl_pred, self.lbl_mask):
+            img_row.addWidget(box[0])
         disp.addLayout(img_row, 1)
 
         verdict_box = QtWidgets.QGroupBox("判定結果")
@@ -518,8 +533,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_score = score
         self.cur_disp_map = disp
         self._show_image(pil, disp)
+        self._show_pred(pil)
         self._show_mask(path)
         self._update_verdict(score)
+
+    def _show_pred(self, pil):
+        pm = self.model.predicted_mask(pil)               # uint8 0/255
+        self.lbl_pred[1].setPixmap(self._np_to_pix(np.stack([pm] * 3, -1), self.lbl_pred[1]))
 
     def _show_mask(self, img_path):
         gt = self._gt_path_for(img_path)

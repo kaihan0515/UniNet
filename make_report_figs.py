@@ -53,33 +53,37 @@ print("score range  good[%.2f,%.2f]  defect[%.2f,%.2f]" % (gs.min(), gs.max(), d
 def triptych(ip, gt, suppress):
     """回傳 (原圖+GT, 熱圖疊加, GT遮罩) 三張 RGB（供 matplotlib 顯示）。"""
     raw = smap(ip)[0]
-    sm = np.clip(raw - bg, 0, None) if suppress else raw
     o = cv2.resize(cv2.imread(ip), (DISP, DISP))
-    smD = cv2.resize(sm, (DISP, DISP))
-    if suppress:
-        smD = smD * ball_roi_mask_gray(cv2.cvtColor(o, cv2.COLOR_BGR2GRAY))
-    vmin, vmax = float(np.percentile(sm, 50)), float(np.percentile(sm, 99.5))
-    x = np.clip((smD - vmin) / (vmax - vmin + 1e-8), 0, 1)
+    roi = ball_roi_mask_gray(cv2.cvtColor(o, cv2.COLOR_BGR2GRAY))
+    amD = cv2.resize(raw, (DISP, DISP)); bgD = cv2.resize(bg, (DISP, DISP))
+    subD = np.clip(amD - bgD, 0, None) * roi
+    disp = subD if suppress else amD
+    vmin, vmax = float(np.percentile(disp, 50)), float(np.percentile(disp, 99.5))
+    x = np.clip((disp - vmin) / (vmax - vmin + 1e-8), 0, 1)
     heat = cv2.applyColorMap((x * 255).astype(np.uint8), cv2.COLORMAP_JET)
     ov = cv2.addWeighted(o, 0.55, heat, 0.45, 0)
+    # UniNet 預測遮罩：球內殘差自身高百分位（只標最異常處）
+    vals = subD[roi > 0.5]; t = float(np.percentile(vals, 99.0)) if vals.size else 0.0
+    pred = ((subD > t) & (roi > 0.5)).astype(np.uint8) * 255
     g = cv2.resize(cv2.imread(gt, 0), (DISP, DISP)) if gt and os.path.exists(gt) else np.zeros((DISP, DISP), np.uint8)
     o2 = o.copy()
     cnts, _ = cv2.findContours((g > 127).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(o2, cnts, -1, (0, 255, 0), 2)
     rgb = lambda im: cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    return rgb(o2), rgb(ov), cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
+    g2 = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
+    return rgb(o2), rgb(ov), cv2.cvtColor(pred, cv2.COLOR_GRAY2RGB), g2
 
 
-COLS = ["原圖 (+GT 綠框)", "異常熱圖疊加", "GT 遮罩"]
+COLS = ["原圖 (+GT 綠框)", "異常熱圖疊加", "UniNet 預測遮罩", "GT 遮罩"]
 
 
 def grid_figure(rowspecs, row_labels, out_png):
-    nr = len(rowspecs)
-    fig, axes = plt.subplots(nr, 3, figsize=(9, 3 * nr + 0.3))
+    nr = len(rowspecs); nc = len(COLS)
+    fig, axes = plt.subplots(nr, nc, figsize=(3 * nc, 3 * nr + 0.3))
     if nr == 1:
         axes = axes[None, :]
     for r, parts in enumerate(rowspecs):
-        for col in range(3):
+        for col in range(nc):
             axes[r, col].imshow(parts[col]); axes[r, col].axis("off")
             if r == 0:
                 axes[r, col].set_title(COLS[col], fontsize=12)

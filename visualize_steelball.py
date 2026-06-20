@@ -90,29 +90,37 @@ def ball_roi_mask_gray(gray, shrink=0.92):
     return mask
 
 
-def overlay_panel(img_path, sm, gt_path, vmin, vmax, suppress=False):
-    """sm: 已平滑(且若 suppress 已減背景)的 256x256 異常圖。"""
-    orig = cv2.imread(img_path)
-    orig = cv2.resize(orig, (DISP, DISP))
-    am = cv2.resize(sm, (DISP, DISP))
-    if suppress:
-        am = am * ball_roi_mask_gray(cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY))
-    am = (am - vmin) / (vmax - vmin + 1e-8)
-    am = np.clip(am, 0, 1)
-    heat = cv2.applyColorMap((am * 255).astype(np.uint8), cv2.COLORMAP_JET)
+def overlay_panel(img_path, sm, gt_path, vmin, vmax, bg, pct, suppress=False):
+    """4 聯：原圖+GT | 異常熱圖 | UniNet 預測遮罩 | GT 遮罩。
+    預測遮罩 = 減背景殘差在球內取「每張自身的高百分位(pct)」二值化（只標最異常處）。"""
+    orig = cv2.resize(cv2.imread(img_path), (DISP, DISP))
+    roi = ball_roi_mask_gray(cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY))
+    amD = cv2.resize(sm, (DISP, DISP))
+    bgD = cv2.resize(bg, (DISP, DISP))
+    subD = np.clip(amD - bgD, 0, None) * roi             # 減背景後的殘差（球內）
+    # 異常熱圖（suppress 時顯示殘差，否則原始異常圖）
+    disp = subD if suppress else amD
+    x = np.clip((disp - vmin) / (vmax - vmin + 1e-8), 0, 1)
+    heat = cv2.applyColorMap((x * 255).astype(np.uint8), cv2.COLORMAP_JET)
     overlay = cv2.addWeighted(orig, 0.55, heat, 0.45, 0)
-
+    # UniNet 預測遮罩：球內殘差的自身高百分位門檻（只標最異常的區域）
+    vals = subD[roi > 0.5]
+    t = float(np.percentile(vals, pct)) if vals.size else 0.0
+    pred = ((subD > t) & (roi > 0.5)).astype(np.uint8) * 255
+    pred_vis = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
+    # GT
+    o2 = orig.copy()
     if gt_path and os.path.exists(gt_path):
         gt = cv2.resize(cv2.imread(gt_path, 0), (DISP, DISP))
         gt_vis = cv2.cvtColor(gt, cv2.COLOR_GRAY2BGR)
         cnts, _ = cv2.findContours((gt > 127).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(orig, cnts, -1, (0, 255, 0), 2)      # GT outline on original (green)
+        cv2.drawContours(o2, cnts, -1, (0, 255, 0), 2)
     else:
         gt_vis = np.zeros((DISP, DISP, 3), np.uint8)
 
-    panel = cv2.hconcat([orig, overlay, gt_vis])
-    for i, txt in enumerate(["original (+GT)", "anomaly heatmap", "ground truth"]):
-        cv2.putText(panel, txt, (10 + i * DISP, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    panel = cv2.hconcat([o2, overlay, pred_vis, gt_vis])
+    for i, txt in enumerate(["original (+GT)", "anomaly heatmap", "UniNet pred mask", "ground truth"]):
+        cv2.putText(panel, txt, (8 + i * DISP, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
     return panel
 
 
@@ -123,6 +131,8 @@ def main():
     ap.add_argument("--suffix", default="BEST_P_PRO")
     ap.add_argument("--suppress", action="store_true",
                     help="抑制背景/反光：減良品平均圖 + 遮掉鋼珠圓形外")
+    ap.add_argument("--pix_pct", type=float, default=99.0,
+                    help="預測遮罩：每張球內殘差的高百分位門檻（99=只標最異常的 1%）")
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -134,20 +144,14 @@ def main():
     cats = sorted([d for d in os.listdir(os.path.join(DATA, "test"))])
     os.makedirs(OUT, exist_ok=True)
 
-    # 抑制模式：先用良品 train/good 算平均異常圖當背景基準
-    bg_map = None
-    if args.suppress:
-        goods = sorted(glob.glob(os.path.join(DATA, "train", "good", "*.jpg")))
-        acc = None
-        for g in goods:
-            am, _ = anomaly_map_for(model, c, Image.open(g).convert("RGB"), device)
-            sm = gaussian_filter(am, sigma=4)
-            acc = sm if acc is None else acc + sm
-        bg_map = acc / max(len(goods), 1)
-        print(f"suppress on: bg_map built from {len(goods)} good images")
+    # 良品 train/good：算背景基準(bg_map，供減背景殘差/抑制顯示用)
+    goods = sorted(glob.glob(os.path.join(DATA, "train", "good", "*.jpg")))
+    bg_map = np.mean([gaussian_filter(anomaly_map_for(model, c, Image.open(g).convert("RGB"), device)[0], 4)
+                      for g in goods], axis=0)
+    print(f"bg_map built from {len(goods)} good images")
 
-    # ---- pass 1: compute all anomaly maps (smoothed, suppressed), collect GLOBAL scale ----
-    items = []          # (cat, img_path, gt_path, sm, score)
+    # ---- pass 1: 算所有測試異常圖 + 全域色階 ----
+    items = []          # (cat, img_path, gt_path, sm_raw, score)
     pooled = []
     for cat in cats:
         imgs = sorted(glob.glob(os.path.join(DATA, "test", cat, "*.jpg")))
@@ -156,13 +160,11 @@ def main():
             stem = os.path.splitext(os.path.basename(ip))[0]
             amap, score = anomaly_map_for(model, c, Image.open(ip).convert("RGB"), device)
             sm = gaussian_filter(amap, sigma=4)
-            if args.suppress and bg_map is not None:
-                sm = np.clip(sm - bg_map, 0, None)
             gt = None if cat == "good" else os.path.join(DATA, "ground_truth", cat, stem + ".png")
             items.append((cat, ip, gt, sm, score))
-            pooled.append(sm.ravel())
+            disp = np.clip(sm - bg_map, 0, None) if args.suppress else sm
+            pooled.append(disp.ravel())
     pooled = np.concatenate(pooled)
-    # shared scale: good imgs stay cool, defect hot-spots go red (robust percentiles)
     vmin, vmax = float(np.percentile(pooled, 50)), float(np.percentile(pooled, 99.5))
 
     # ---- pass 2: render with the shared scale ----
@@ -171,7 +173,7 @@ def main():
         out_dir = os.path.join(OUT, cat)
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(ip))[0]
-        panel = overlay_panel(ip, sm, gt, vmin, vmax, suppress=args.suppress)
+        panel = overlay_panel(ip, sm, gt, vmin, vmax, bg_map, args.pix_pct, suppress=args.suppress)
         cv2.imwrite(os.path.join(out_dir, f"{stem}_score{score:.3f}.png"), panel)
         per_cat_cnt[cat] = per_cat_cnt.get(cat, 0) + 1
     for cat, cnt in sorted(per_cat_cnt.items()):
