@@ -87,6 +87,21 @@ def make_overlay_bgr(pil, disp):
     return cv2.addWeighted(bgr, 0.55, heat, 0.45, 0)
 
 
+def ball_roi_mask(pil, shrink=0.92):
+    """偵測鋼珠圓形範圍，回傳 {0,1} float mask（球外=0，用來遮掉背景）。"""
+    g = cv2.medianBlur(np.array(pil.convert("L")), 5)
+    h, w = g.shape; r = min(h, w)
+    cir = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, 1, minDist=r, param1=100, param2=30,
+                           minRadius=int(0.30 * r), maxRadius=int(0.55 * r))
+    if cir is None:
+        cx, cy, rad = w // 2, h // 2, int(0.46 * r)          # 偵測失敗 -> 置中圓
+    else:
+        cx, cy, rad = np.round(cir[0, 0]).astype(int)
+    mask = np.zeros((h, w), np.float32)
+    cv2.circle(mask, (int(cx), int(cy)), int(rad * shrink), 1.0, -1)
+    return mask
+
+
 # ===========================================================================
 #  MODEL
 # ===========================================================================
@@ -111,6 +126,7 @@ class UniNetADModel:
         self.model = None
         self.train_good_scores = None
         self.default_threshold = None
+        self.bg_map = None                 # 良品平均異常圖（背景/反光基準，供抑制用）
         self._tf = T.Compose([
             T.Resize((self.c.image_size, self.c.image_size), InterpolationMode.LANCZOS),
             T.ToTensor()])
@@ -136,39 +152,49 @@ class UniNetADModel:
                             Target_teacher, bn, student, DFS)
         self.model.train_or_eval(type='eval')
 
-    # --- 單張推論 ---------------------------------------------------------- #
     @torch.no_grad()
-    def predict(self, pil_image):
-        """回傳 (異常分數 float, 熱圖 np.float32 HxW 已 min-max 正規化到 0..1)。"""
-        ow, oh = pil_image.size
+    def _infer(self, pil_image):
+        """前向推論，回傳 (異常分數 float, 原始 256x256 異常圖 np.float32)。"""
         x = self._norm(self._tf(pil_image))[None].to(self.device)
         t_tf, de_features = self.model(x)
         output_list = [[] for _ in range(self.model.n * 3)]
         for l, (t, s) in enumerate(zip(t_tf, de_features)):
             output_list[l].append(1 - F.cosine_similarity(t, s))
         score, amap = weighted_decision_mechanism(1, output_list, self.c.alpha, self.c.beta)
-        score = float(np.array(score).reshape(-1)[0])
-        m = gaussian_filter(amap[0], sigma=4)               # 256x256
+        return float(np.array(score).reshape(-1)[0]), amap[0]
+
+    # --- 單張推論（suppress_bg=True 抑制背景/反光；分數不受影響）---------- #
+    @torch.no_grad()
+    def predict(self, pil_image, suppress_bg=False):
+        ow, oh = pil_image.size
+        score, amap = self._infer(pil_image)
+        m = gaussian_filter(amap, sigma=4)                  # 256x256
+        if suppress_bg and self.bg_map is not None:
+            m = np.clip(m - self.bg_map, 0, None)           # 減良品平均反光響應
         disp = cv2.resize(m, (ow, oh))
+        if suppress_bg:
+            disp = disp * ball_roi_mask(pil_image)          # 遮掉鋼珠圓形外的背景
         mn, mx = float(disp.min()), float(disp.max())
         disp = (disp - mn) / (mx - mn + 1e-8) * 255.0       # min-max 正規化到 0–255
         return score, disp.astype(np.float32)
 
-    # --- 用良品集算分數 -> 預設門檻 --------------------------------------- #
+    # --- 用良品集算分數 -> 預設門檻 + 平均異常圖(背景基準) --------------- #
     @torch.no_grad()
     def compute_train_scores(self, good_dir, progress=None):
         files = list_images(good_dir)
         if not files:
             raise RuntimeError("找不到良品影像：%s" % good_dir)
-        scores = []
+        scores, acc = [], None
         for i, f in enumerate(files):
-            sc, _ = self.predict(Image.open(f).convert("RGB"))
+            sc, amap = self._infer(Image.open(f).convert("RGB"))
             scores.append(sc)
+            gm = gaussian_filter(amap, sigma=4)
+            acc = gm if acc is None else acc + gm
             if progress:
-                progress(i + 1, len(files), "計算良品分數")
+                progress(i + 1, len(files), "計算良品分數/背景基準")
         self.train_good_scores = np.array(scores, dtype=np.float32)
-        # 預設門檻：良品最高分再加 10% 緩衝（無監督）
         self.default_threshold = float(self.train_good_scores.max() * 1.1)
+        self.bg_map = acc / len(files)                       # 256x256 良品平均異常圖
 
 
 # ===========================================================================
@@ -228,19 +254,20 @@ class SaveHeatmapWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(int, int, str)
     done = QtCore.pyqtSignal(int, str)                 # 已存張數, 輸出資料夾
 
-    def __init__(self, model, items, out_dir, threshold):
+    def __init__(self, model, items, out_dir, threshold, suppress_bg=False):
         super().__init__()
         self.model = model
         self.items = items                             # list of (path, cat)
         self.out_dir = out_dir
         self.threshold = threshold
+        self.suppress_bg = suppress_bg
 
     def run(self):
         n, cnt = len(self.items), 0
         for i, (p, cat) in enumerate(self.items):
             try:
                 pil = Image.open(p).convert("RGB")
-                score, disp = self.model.predict(pil)
+                score, disp = self.model.predict(pil, suppress_bg=self.suppress_bg)
                 orig = np.array(pil)[:, :, ::-1].copy()           # BGR
                 overlay = make_overlay_bgr(pil, disp)
                 panel = cv2.hconcat([orig, overlay])
@@ -341,6 +368,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save_heat = QtWidgets.QPushButton("批次另存熱圖")
         ctrl.addWidget(self.btn_export_csv)
         ctrl.addWidget(self.btn_save_heat)
+        self.chk_suppress = QtWidgets.QCheckBox("抑制背景/反光（熱圖）")
+        self.chk_suppress.setToolTip("減良品平均圖 + 遮掉鋼珠圓形外，讓熱圖聚焦在瑕疵；不影響分數")
+        ctrl.addWidget(self.chk_suppress)
         thr_box = QtWidgets.QGroupBox("門檻調整")
         tg = QtWidgets.QHBoxLayout(thr_box)
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -365,7 +395,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save_heat.clicked.connect(self.on_save_heatmaps)
         self.list_widget.currentItemChanged.connect(self.on_select)
         self.slider.valueChanged.connect(self.on_threshold_changed)
+        self.chk_suppress.toggled.connect(self.on_suppress_toggled)
         self._set_busy(True)
+
+    def on_suppress_toggled(self, _checked):
+        cur = self.list_widget.currentItem()
+        if cur is not None:
+            self.on_select(cur, None)
 
     def _image_label(self, title, minsize=260):
         box = QtWidgets.QGroupBox(title)
@@ -478,7 +514,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.status.showMessage("無法開啟影像：%s" % e)
             return
-        score, disp = self.model.predict(pil)
+        score, disp = self.model.predict(pil, suppress_bg=self.chk_suppress.isChecked())
         self.cur_score = score
         self.cur_disp_map = disp
         self._show_image(pil, disp)
@@ -600,7 +636,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not out:
             return
         self._set_busy(True)
-        self.shw = SaveHeatmapWorker(self.model, items, out, self.threshold)
+        self.shw = SaveHeatmapWorker(self.model, items, out, self.threshold,
+                                     suppress_bg=self.chk_suppress.isChecked())
         self.shw.progress.connect(self._on_progress)
         self.shw.done.connect(self._on_save_heat_done)
         self.shw.start()
@@ -676,7 +713,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- 工具 ---------------- #
     def _set_busy(self, busy):
         for w in (self.btn_open_img, self.btn_open_folder, self.btn_eval,
-                  self.btn_export_csv, self.btn_save_heat, self.list_widget):
+                  self.btn_export_csv, self.btn_save_heat, self.chk_suppress, self.list_widget):
             w.setEnabled(not busy)
         self.progress.setVisible(busy)
 
