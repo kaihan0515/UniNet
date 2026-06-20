@@ -355,10 +355,12 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(self.lbl_score)
         disp.addWidget(verdict_box)
 
-        # ===== 圖表區（中）：分數分布 / ROC + 指標 =====
-        charts = QtWidgets.QVBoxLayout()
-        root.addLayout(charts, 2)
-        self.canvas = FigureCanvas(Figure(figsize=(4.2, 6)))
+        # ===== 圖表區（中，固定較窄寬度，把空間留給影像）=====
+        charts_w = QtWidgets.QWidget()
+        charts_w.setFixedWidth(380)
+        charts = QtWidgets.QVBoxLayout(charts_w)
+        charts.setContentsMargins(0, 0, 0, 0)
+        self.canvas = FigureCanvas(Figure(figsize=(3.6, 6)))
         self.ax_hist = self.canvas.figure.add_subplot(211)
         self.ax_roc = self.canvas.figure.add_subplot(212)
         self._init_axes()
@@ -367,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_metrics.setWordWrap(True)
         self.lbl_metrics.setAlignment(QtCore.Qt.AlignTop)
         charts.addWidget(self.lbl_metrics)
+        root.addWidget(charts_w, 0)
 
         # ===== 操作區（右）：所有「需點選」的控制集中於此 =====
         ctrl_box = QtWidgets.QGroupBox("操作區")
