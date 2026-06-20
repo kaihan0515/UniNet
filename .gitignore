@@ -27,3 +27,6 @@ Thumbs.db
 # Visualization output (regenerate with visualize_steelball.py)
 /viz/
 test_result.log
+/figs/
+/uninet_results.csv
+ckpts/**/*.csv

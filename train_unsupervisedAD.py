@@ -1,5 +1,6 @@
 import copy
 import time
+import csv
 
 import torch
 import numpy as np
@@ -25,6 +26,11 @@ def train(c):
         ckpt_path = os.path.join("./ckpts", dataset_name)
     else:
         ckpt_path = os.path.join("./ckpts", dataset_name, f"{c._class_}")
+
+    # 訓練紀錄（每個 epoch 的 loss 與評估指標）-> CSV，供 plot_training.py 畫 loss 曲線
+    os.makedirs(ckpt_path, exist_ok=True)
+    _log_csv = os.path.join(ckpt_path, "train_log.csv")
+    _log_rows = [["epoch", "loss", "image_auroc", "pixel_auroc", "pixel_aupro"]]
 
     # ---------------------------------loading dataset-----------------------------------------------
     train_dataloader, test_dataloader = loading_dataset(c, dataset_name)
@@ -119,3 +125,17 @@ def train(c):
                 test_folder = 'video/ped2/testing/frames'
                 auroc = evaluation_video(c, model, test_folder, test_dataloader, device)
                 print('Auroc: {:.2f}'.format(auroc))
+
+        # --- 記錄本 epoch 的 loss / 指標到 CSV（指標僅在評估的 epoch 有值）---
+        try:
+            _loss = float(np.mean(loss_list)) if loss_list else float("nan")
+            _ev = ((epoch + 1) % 10 == 0 and c.domain in ['industrial', 'video']
+                   and dataset_name in ['MVTec AD', 'BTAD', 'MVTec 3D-AD', "VisA", "SteelBall"])
+            _log_rows.append([epoch + 1, round(_loss, 6),
+                              round(float(auroc_sp), 4) if _ev else "",
+                              round(float(auroc_px), 4) if _ev else "",
+                              round(float(aupro_px), 4) if _ev else ""])
+            with open(_log_csv, "w", newline="", encoding="utf-8") as _fh:
+                csv.writer(_fh).writerows(_log_rows)
+        except Exception:
+            pass
