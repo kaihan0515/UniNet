@@ -57,18 +57,19 @@ from utils import load_weights, to_device
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 
-def _ver(weights_sub, data_sub):
+def _ver(weights_sub, data_sub, patch=False):
     d = os.path.normpath(os.path.join(BASE, "..", "data", data_sub, "steelball"))
     return {"weights": os.path.join(BASE, "ckpts", weights_sub, "steelball"),
             "train_good": os.path.join(d, "train", "good"),
-            "test_dir": os.path.join(d, "test")}
+            "test_dir": os.path.join(d, "test"), "patch": patch}
 
 
-# 可在 GUI 下拉切換的模型版本（權重 + 對應的對齊/未對齊資料）
+# 可在 GUI 下拉切換的模型版本（權重 + 對應的對齊/未對齊資料；patch=True 走 patch 推論）
 VERSIONS = {
     "SteelBall（基準/未對齊）": _ver("SteelBall", "steelball"),
     "SteelBallA（對齊）": _ver("SteelBallA", "steelball_aligned"),
     "SteelBallSyn（對齊+合成）": _ver("SteelBallSyn", "steelball_aligned"),
+    "SteelBallPatch（4×4 patch）": _ver("SteelBallPatch", "steelball", patch=True),
 }
 _DEFAULT_VER = "SteelBall（基準/未對齊）"
 DEFAULT_WEIGHTS_DIR = VERSIONS[_DEFAULT_VER]["weights"]
@@ -116,6 +117,13 @@ def ball_roi_mask(pil, shrink=0.92):
     return mask
 
 
+def _center_roi(size, frac=0.46):
+    """置中圓形 ROI（patch 模式的球已對齊置中）。"""
+    m = np.zeros((size, size), np.float32)
+    cv2.circle(m, (size // 2, size // 2), int(size * frac), 1.0, -1)
+    return m
+
+
 # ===========================================================================
 #  MODEL
 # ===========================================================================
@@ -132,10 +140,11 @@ class Cfg:
 class UniNetADModel:
     """封裝訓練好的 UniNet，負責推論與門檻設定。"""
 
-    def __init__(self, weights_dir, suffix="BEST_P_PRO", device=DEVICE):
+    def __init__(self, weights_dir, suffix="BEST_P_PRO", device=DEVICE, patch_mode=False):
         self.weights_dir = weights_dir
         self.suffix = suffix
         self.device = device
+        self.patch_mode = patch_mode       # True: 對齊→切 4×4 patch→拼回（在對齊空間顯示）
         self.c = Cfg()
         self.model = None
         self.train_good_scores = None
@@ -177,32 +186,72 @@ class UniNetADModel:
         score, amap = weighted_decision_mechanism(1, output_list, self.c.alpha, self.c.beta)
         return float(np.array(score).reshape(-1)[0]), amap[0]
 
+    def _patch_align(self, pil_image):
+        import train_patch as TP
+        img = np.array(pil_image)[:, :, ::-1].copy()         # BGR
+        cx, cy, r = TP.detect_ball(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        return TP.align_hi(img, cx, cy, r, cv2.BORDER_REPLICATE, cv2.INTER_AREA), (cx, cy, r)
+
+    @torch.no_grad()
+    def _infer_patch(self, pil_image):
+        """patch 模式：對齊→切 4×4→拼回，回傳 (分數, 256 已平滑異常圖)（對齊空間）。"""
+        import train_patch as TP
+        a512, _ = self._patch_align(pil_image)
+        full = TP.stitch_anomaly(self.model, a512, self.c, self.device)   # 512, 已 gaussian
+        m = cv2.resize(full, (256, 256))
+        return float(m.max()), m
+
+    def _smoothed(self, pil_image):
+        """回傳 (分數, 256 平滑異常圖)：whole 用 _infer+gaussian；patch 用 _infer_patch。"""
+        if self.patch_mode:
+            return self._infer_patch(pil_image)
+        sc, amap = self._infer(pil_image)
+        return sc, gaussian_filter(amap, sigma=4)
+
+    def display_image(self, pil_image):
+        """要顯示的影像：patch 模式回傳對齊後 256 的球；否則原圖。"""
+        if self.patch_mode:
+            a512, _ = self._patch_align(pil_image)
+            return Image.fromarray(cv2.cvtColor(cv2.resize(a512, (256, 256)), cv2.COLOR_BGR2RGB))
+        return pil_image
+
+    def align_gt_256(self, img_path, gt_path):
+        """patch 模式：把 GT 遮罩用與影像相同的對齊裁切到 256。"""
+        import train_patch as TP
+        img = cv2.imread(img_path)
+        cx, cy, r = TP.detect_ball(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        g = cv2.imread(gt_path, 0)
+        a = TP.align_hi(g, cx, cy, r, cv2.BORDER_CONSTANT, cv2.INTER_NEAREST)
+        return cv2.resize(a, (256, 256))
+
     # --- 單張推論（suppress_bg=True 抑制背景/反光；分數不受影響）---------- #
     @torch.no_grad()
     def predict(self, pil_image, suppress_bg=False):
-        ow, oh = pil_image.size
-        score, amap = self._infer(pil_image)
-        m = gaussian_filter(amap, sigma=4)                  # 256x256
+        score, m = self._smoothed(pil_image)
         if suppress_bg and self.bg_map is not None:
-            m = np.clip(m - self.bg_map, 0, None)           # 減良品平均反光響應
-        disp = cv2.resize(m, (ow, oh))
-        if suppress_bg:
-            disp = disp * ball_roi_mask(pil_image)          # 遮掉鋼珠圓形外的背景
+            m = np.clip(m - self.bg_map, 0, None)
+        if self.patch_mode:
+            disp = m * _center_roi(256) if suppress_bg else m       # 對齊空間 256
+        else:
+            ow, oh = pil_image.size
+            disp = cv2.resize(m, (ow, oh))
+            if suppress_bg:
+                disp = disp * ball_roi_mask(pil_image)
         mn, mx = float(disp.min()), float(disp.max())
-        disp = (disp - mn) / (mx - mn + 1e-8) * 255.0       # min-max 正規化到 0–255
+        disp = (disp - mn) / (mx - mn + 1e-8) * 255.0
         return score, disp.astype(np.float32)
 
     @torch.no_grad()
     def predicted_mask(self, pil_image, pct=99.0):
         """UniNet 預測遮罩：減背景殘差在球內取自身高百分位二值化（uint8 0/255）。"""
-        ow, oh = pil_image.size
-        _, amap = self._infer(pil_image)
-        sm = gaussian_filter(amap, sigma=4)
+        _, m = self._smoothed(pil_image)
         if self.bg_map is not None:
-            sm = np.clip(sm - self.bg_map, 0, None)
-        sub = cv2.resize(sm, (ow, oh))
-        roi = ball_roi_mask(pil_image)
-        sub = sub * roi
+            m = np.clip(m - self.bg_map, 0, None)
+        if self.patch_mode:
+            sub = m * _center_roi(256); roi = _center_roi(256)
+        else:
+            ow, oh = pil_image.size
+            sub = cv2.resize(m, (ow, oh)); roi = ball_roi_mask(pil_image); sub = sub * roi
         vals = sub[roi > 0.5]
         t = float(np.percentile(vals, pct)) if vals.size else 0.0
         return (((sub > t) & (roi > 0.5)).astype(np.uint8) * 255)
@@ -215,10 +264,9 @@ class UniNetADModel:
             raise RuntimeError("找不到良品影像：%s" % good_dir)
         scores, acc = [], None
         for i, f in enumerate(files):
-            sc, amap = self._infer(Image.open(f).convert("RGB"))
+            sc, m = self._smoothed(Image.open(f).convert("RGB"))
             scores.append(sc)
-            gm = gaussian_filter(amap, sigma=4)
-            acc = gm if acc is None else acc + gm
+            acc = m if acc is None else acc + m
             if progress:
                 progress(i + 1, len(files), "計算良品分數/背景基準")
         self.train_good_scores = np.array(scores, dtype=np.float32)
@@ -450,7 +498,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.weights_dir = v["weights"]
         self.train_good = v["train_good"]
         self.test_dir = v["test_dir"]
-        self.model = UniNetADModel(self.weights_dir, suffix=self.suffix_combo.currentText())
+        self.model = UniNetADModel(self.weights_dir, suffix=self.suffix_combo.currentText(),
+                                   patch_mode=v.get("patch", False))
         # 重置狀態與畫面
         self.eval_paths = self.eval_labels = self.eval_scores = self.eval_cats = None
         self.cur_score = None
@@ -582,7 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
         score, disp = self.model.predict(pil, suppress_bg=self.chk_suppress.isChecked())
         self.cur_score = score
         self.cur_disp_map = disp
-        self._show_image(pil, disp)
+        self._show_image(self.model.display_image(pil), disp)   # patch 模式顯示對齊後的球
         self._show_pred(pil)
         self._show_mask(path)
         self._update_verdict(score)
@@ -597,7 +646,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_mask[1].setPixmap(QtGui.QPixmap())
             self.lbl_mask[1].setText("（無遮罩 / 良品）")
             return
-        m = cv2.imread(gt, 0)
+        if self.model.patch_mode:
+            m = self.model.align_gt_256(img_path, gt)          # GT 對齊到同空間
+        else:
+            m = cv2.imread(gt, 0)
         if m is None:
             self.lbl_mask[1].setText("（遮罩讀取失敗）")
             return
