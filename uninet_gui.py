@@ -55,11 +55,25 @@ from utils import load_weights, to_device
 # 預設路徑（可在 GUI 內用按鈕更換）。資料在 repo 外的 ../data。
 # --------------------------------------------------------------------------- #
 BASE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_WEIGHTS_DIR = os.path.join(BASE, "ckpts", "SteelBall", "steelball")
-DEFAULT_TRAIN_GOOD = os.path.normpath(os.path.join(
-    BASE, "..", "data", "steelball", "steelball", "train", "good"))
-DEFAULT_TEST_DIR = os.path.normpath(os.path.join(
-    BASE, "..", "data", "steelball", "steelball", "test"))
+
+
+def _ver(weights_sub, data_sub):
+    d = os.path.normpath(os.path.join(BASE, "..", "data", data_sub, "steelball"))
+    return {"weights": os.path.join(BASE, "ckpts", weights_sub, "steelball"),
+            "train_good": os.path.join(d, "train", "good"),
+            "test_dir": os.path.join(d, "test")}
+
+
+# 可在 GUI 下拉切換的模型版本（權重 + 對應的對齊/未對齊資料）
+VERSIONS = {
+    "SteelBall（基準/未對齊）": _ver("SteelBall", "steelball"),
+    "SteelBallA（對齊）": _ver("SteelBallA", "steelball_aligned"),
+    "SteelBallSyn（對齊+合成）": _ver("SteelBallSyn", "steelball_aligned"),
+}
+_DEFAULT_VER = "SteelBall（基準/未對齊）"
+DEFAULT_WEIGHTS_DIR = VERSIONS[_DEFAULT_VER]["weights"]
+DEFAULT_TRAIN_GOOD = VERSIONS[_DEFAULT_VER]["train_good"]
+DEFAULT_TEST_DIR = VERSIONS[_DEFAULT_VER]["test_dir"]
 
 IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -375,6 +389,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_box = QtWidgets.QGroupBox("操作區")
         ctrl_box.setFixedWidth(300)
         ctrl = QtWidgets.QVBoxLayout(ctrl_box)
+        ver_box = QtWidgets.QGroupBox("模型版本")
+        vb = QtWidgets.QVBoxLayout(ver_box)
+        self.version_combo = QtWidgets.QComboBox()
+        self.version_combo.addItems(list(VERSIONS.keys()))
+        self.suffix_combo = QtWidgets.QComboBox()
+        self.suffix_combo.addItems(["BEST_P_PRO", "BEST_P_ROC"])
+        vb.addWidget(self.version_combo)
+        vb.addWidget(self.suffix_combo)
+        ctrl.addWidget(ver_box)
         self.btn_open_img = QtWidgets.QPushButton("開啟單張影像")
         self.btn_open_folder = QtWidgets.QPushButton("開啟資料夾")
         ctrl.addWidget(self.btn_open_img)
@@ -416,7 +439,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list_widget.currentItemChanged.connect(self.on_select)
         self.slider.valueChanged.connect(self.on_threshold_changed)
         self.chk_suppress.toggled.connect(self.on_suppress_toggled)
+        self.version_combo.currentIndexChanged.connect(self.on_version_changed)
+        self.suffix_combo.currentIndexChanged.connect(self.on_version_changed)
         self._set_busy(True)
+
+    def on_version_changed(self, *_):
+        v = VERSIONS.get(self.version_combo.currentText())
+        if v is None or not self.model.is_ready():
+            return
+        self.weights_dir = v["weights"]
+        self.train_good = v["train_good"]
+        self.test_dir = v["test_dir"]
+        self.model = UniNetADModel(self.weights_dir, suffix=self.suffix_combo.currentText())
+        # 重置狀態與畫面
+        self.eval_paths = self.eval_labels = self.eval_scores = self.eval_cats = None
+        self.cur_score = None
+        self.list_widget.clear()
+        self.lbl_metrics.setText("尚未評估測試集")
+        self.ax_hist.clear(); self.ax_roc.clear(); self._init_axes()
+        for lbl in (self.lbl_orig[1], self.lbl_heat[1], self.lbl_pred[1], self.lbl_mask[1]):
+            lbl.setPixmap(QtGui.QPixmap()); lbl.setText("（無影像）")
+        self.lbl_verdict.setText("—"); self.lbl_verdict.setStyleSheet("")
+        self.lbl_score.setText("異常分數: —    門檻: —")
+        self._start_load()
 
     def on_suppress_toggled(self, _checked):
         cur = self.list_widget.currentItem()
@@ -738,7 +783,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- 工具 ---------------- #
     def _set_busy(self, busy):
         for w in (self.btn_open_img, self.btn_open_folder, self.btn_eval,
-                  self.btn_export_csv, self.btn_save_heat, self.chk_suppress, self.list_widget):
+                  self.btn_export_csv, self.btn_save_heat, self.chk_suppress,
+                  self.version_combo, self.suffix_combo, self.list_widget):
             w.setEnabled(not busy)
         self.progress.setVisible(busy)
 
